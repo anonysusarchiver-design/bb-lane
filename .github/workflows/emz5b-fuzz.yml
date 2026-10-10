@@ -1,0 +1,265 @@
+# bb-lane — emz5b: ASAN fuzzing warm-up (E-MZ-5b).
+#
+# Single bounded job on a fresh GH runner:
+#   1. fetch the taskcluster ASAN fuzzing jsshell (linux64-fuzzing-asan-opt ->
+#      target.jsshell.zip; proven route from E-MZ-5a; never rebuilt here)
+#   2. verify the shell is ASAN-instrumented (strings + ASAN_OPTIONS=help=1)
+#   3. compile the WAT mutation seeds with the shell itself (wasmTextToBinary)
+#   4. regression battery under ASAN: emz5/smoke.js + the Y1 A2/A1 trigger scripts
+#      (oversize array.new; oomTest OOL struct.new) — expect NO ASAN reports
+#   5. bounded deterministic mutation fuzz over the seeds: one jsshell process per
+#      batch, --fuzzing-safe --no-threads, seeded PRNG; any crash is captured with
+#      the ASAN report + the exact mutating input (emit + single-mutant repro)
+#
+# Public content only: no secrets, no repo-sourced data, read-only public fetches.
+name: emz5b-fuzz
+run-name: emz5b-fuzz ${{ github.event.inputs.name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "run label (a-z0-9-, used in the run title)"
+        required: false
+        default: "warmup"
+      kit_b64:
+        description: "kit JSON {files:[{path,data(b64)}]}, base64 (or z:+zlib)"
+        required: true
+      source_url:
+        description: "explicit ASAN jsshell zip URL (empty = resolve taskcluster index at runtime)"
+        required: false
+        default: ""
+      fuzz_secs:
+        description: "bounded fuzz loop wall seconds"
+        required: false
+        default: "1200"
+      batch_size:
+        description: "mutants per batch process"
+        required: false
+        default: "250"
+      max_ops:
+        description: "max mutation ops per mutant"
+        required: false
+        default: "6"
+      base_seed:
+        description: "base PRNG seed; batch b uses base_seed+b"
+        required: false
+        default: "424242"
+      timeout_min:
+        description: "job timeout minutes (5-350)"
+        required: false
+        default: "45"
+
+concurrency:
+  group: emz5b-fuzz-${{ github.event.inputs.name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_min || '45') }}
+    env:
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=1"
+      FUZZ_SECS: ${{ github.event.inputs.fuzz_secs || '1200' }}
+      BATCH_SIZE: ${{ github.event.inputs.batch_size || '250' }}
+      MAX_OPS: ${{ github.event.inputs.max_ops || '6' }}
+      BASE_SEED: ${{ github.event.inputs.base_seed || '424242' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Runner probe
+        run: |
+          set -x
+          date -u
+          uname -a
+          nproc
+          free -h | head -2
+          df -h / | tail -1
+          python3 --version
+          (command -v llvm-symbolizer && llvm-symbolizer --version | head -1) || echo "llvm-symbolizer: absent"
+          mkdir -p out
+
+      - name: Decode kit
+        env:
+          KIT_B64: ${{ github.event.inputs.kit_b64 }}
+        run: |
+          python3 - <<'PY'
+          import base64, os, zlib, json
+          b64 = os.environ["KIT_B64"]
+          data = zlib.decompress(base64.b64decode(b64[2:])) if b64.startswith("z:") else base64.b64decode(b64)
+          kit = json.loads(data.decode())
+          n = 0; total = 0
+          for f in kit["files"]:
+              p = f["path"]
+              assert p.startswith("kit/") and ".." not in p, "bad kit path: " + p
+              os.makedirs(os.path.dirname(p), exist_ok=True)
+              raw = base64.b64decode(f["data"])
+              open(p, "wb").write(raw)
+              n += 1; total += len(raw)
+          print("kit files:", n, "bytes:", total)
+          PY
+          chmod +x kit/run-fuzz.sh 2>/dev/null || true
+          find kit -type f | sort
+
+      - name: Fetch ASAN fuzzing jsshell
+        id: fetch
+        run: |
+          set -o pipefail
+          URL="${{ github.event.inputs.source_url }}"
+          if [ -z "$URL" ]; then
+            TASKID=$(curl -fsS --max-time 60 "https://firefox-ci-tc.services.mozilla.com/api/index/v1/task/gecko.v2.mozilla-central.latest.firefox.linux64-fuzzing-asan-opt" | python3 -c "import sys,json;print(json.load(sys.stdin)['taskId'])")
+            URL="https://firefox-ci-tc.services.mozilla.com/api/queue/v1/task/$TASKID/artifacts/public/build/target.jsshell.zip"
+          fi
+          echo "asan-url=$URL" | tee out/asan-url.txt
+          bash emz5/fetch-jsshell.sh jsshell-asan "$URL" 2>&1 | tee out/fetch.log
+
+      - name: Verify ASAN shell
+        run: |
+          set -x
+          JS=$(head -1 jsshell-asan/js-path.txt)
+          case "$JS" in /*) ;; *) JS="$PWD/$JS" ;; esac
+          echo "$JS" | tee out/js-path.txt
+          "$JS" --version | tee out/js-version.txt
+          stat -c '%s bytes' "$JS" | tee out/js-size.txt
+          sha256sum jsshell-asan/jsshell.zip "$JS" | tee out/sha256.txt
+          set +e
+          strings -a "$JS" | grep -m1 "__asan_report" > out/asan-strings.txt 2>&1
+          echo "asan-strings-rc=$?" >> out/asan-strings.txt
+          ASAN_OPTIONS=help=1:detect_leaks=0 "$JS" --version > out/asan-help.log 2>&1
+          echo "asan-help-rc=$?" >> out/asan-help.log
+          if grep -m1 -qi "AddressSanitizer" out/asan-help.log; then
+            echo "asan-runtime=detected" | tee out/asan-runtime.txt
+          else
+            echo "asan-runtime=NOT-detected" | tee out/asan-runtime.txt
+          fi
+          set -e
+
+      - name: Build seed binaries (wat -> hex via the shell itself)
+        id: seeds
+        run: |
+          set -u
+          JS=$(head -1 jsshell-asan/js-path.txt)
+          mkdir -p seeds-hex
+          ok=0; fail=0
+          for f in kit/seeds/*.wat; do
+            name=$(basename "$f" .wat)
+            if timeout 120 "$JS" kit/build-seeds.js "$f" > "seeds-hex/$name.hex.line" 2> "seeds-hex/$name.err"; then
+              ok=$((ok+1))
+              grep -o '^SEED name=[^ ]* len=[0-9]*' "seeds-hex/$name.hex.line" || true
+            else
+              fail=$((fail+1))
+              echo "SEED-BUILD-FAIL $name"
+              head -5 "seeds-hex/$name.err" || true
+            fi
+          done
+          echo "seeds ok=$ok fail=$fail" | tee out/seeds-summary.txt
+          test "$ok" -ge 3 || { echo "SEED-BUILD-ERROR: fewer than 3 seeds built"; exit 1; }
+
+      - name: Capability probes (normal + fuzzing-safe)
+        continue-on-error: true
+        run: |
+          JS=$(head -1 jsshell-asan/js-path.txt)
+          timeout 120 "$JS" kit/probe-cap.js > out/cap-normal.txt 2>&1; echo "probe rc=$?" >> out/cap-normal.txt
+          timeout 120 "$JS" --fuzzing-safe --no-threads kit/probe-cap.js > out/cap-fuzzsafe.txt 2>&1; echo "probe rc=$?" >> out/cap-fuzzsafe.txt
+          echo "---- normal tail ----"; tail -8 out/cap-normal.txt
+          echo "---- fuzzing-safe tail ----"; tail -8 out/cap-fuzzsafe.txt
+
+      - name: Regression battery (smoke + A2 + A1 triggers under ASAN shell)
+        id: regress
+        run: |
+          set -u
+          JS=$(head -1 jsshell-asan/js-path.txt)
+          mkdir -p out/regress
+          run_one() {
+            name="$1"; script="$2"
+            t0=$(date +%s)
+            timeout 600 "$JS" "$script" > "out/regress/$name.log" 2>&1
+            rc=$?
+            dt=$(( $(date +%s) - t0 ))
+            echo "REGRESS $name rc=$rc secs=$dt script=$script" | tee -a out/regress/summary.txt
+          }
+          run_one smoke emz5/smoke.js
+          run_one a2 kit/regress-a2.js
+          run_one a1 kit/regress-a1.js
+          grep -H -m1 "AddressSanitizer" out/regress/*.log > out/regress/asan-hits.txt 2>/dev/null || echo "no-asan-reports-in-regression" > out/regress/asan-hits.txt
+          cat out/regress/asan-hits.txt
+          echo "---- key lines ----"
+          grep -h -E "EMZ5-SMOKE OK|a2.done|res.trapStage1|oomTest.threw|res.ok" out/regress/*.log || true
+
+      - name: Fuzz loop (bounded, one jsshell process per batch)
+        id: fuzz
+        timeout-minutes: 35
+        continue-on-error: true
+        run: |
+          JS=$(head -1 jsshell-asan/js-path.txt)
+          bash kit/run-fuzz.sh "$JS" kit/fuzz-driver.js seeds-hex out/fuzz "$FUZZ_SECS" "$BATCH_SIZE" "$MAX_OPS" "$BASE_SEED" 2>&1 | tee out/fuzz-console.txt
+
+      - name: Assemble evidence
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "{"
+            echo "  \"run_id\": \"$GITHUB_RUN_ID\","
+            echo "  \"run_url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\","
+            echo "  \"commit\": \"$GITHUB_SHA\","
+            echo "  \"name\": \"${{ github.event.inputs.name }}\","
+            echo "  \"fuzz_secs\": \"$FUZZ_SECS\","
+            echo "  \"batch_size\": \"$BATCH_SIZE\","
+            echo "  \"max_ops\": \"$MAX_OPS\","
+            echo "  \"base_seed\": \"$BASE_SEED\","
+            echo "  \"date_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            echo "}"
+          } > out/meta.json
+          cp -r kit out/kit
+          ls -l out out/regress out/fuzz 2>/dev/null | head -60 || true
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emz5b-evidence
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Verdict
+        if: always()
+        env:
+          REGRESS_OUTCOME: ${{ steps.regress.outcome }}
+          FUZZ_OUTCOME: ${{ steps.fuzz.outcome }}
+        run: |
+          set -u
+          test -f jsshell-asan/js-path.txt || { echo "VERDICT: FETCH FAILED (see out/fetch.log)"; exit 1; }
+          grep -q '^SEED ' seeds-hex/*.hex.line 2>/dev/null || { echo "VERDICT: SEEDS FAILED"; exit 1; }
+          echo "regress=$REGRESS_OUTCOME fuzz=$FUZZ_OUTCOME"
+          if grep -q "AddressSanitizer" out/regress/*.log 2>/dev/null; then
+            echo "VERDICT: REGRESSION-ASAN-REPORT — contradicts the Y1 baseline, investigate NOW (see artifact)"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os
+          fuzz_dir = "out/fuzz"
+          summary = {}
+          try:
+              summary = json.load(open(os.path.join(fuzz_dir, "summary.json")))
+          except Exception as e:
+              print("fuzz summary unreadable:", e)
+          reg = open("out/regress/summary.txt").read() if os.path.exists("out/regress/summary.txt") else "(missing)"
+          print(reg.strip())
+          print("fuzz summary:", json.dumps(summary))
+          if summary.get("asan_found"):
+              print("VERDICT: ASAN CRASH FOUND IN FUZZ — evidence captured (input + report in artifact); pipeline VALID")
+          elif summary.get("batches", 0) and not summary.get("stopped"):
+              print("VERDICT: pipeline VALID — ASAN shell live, regression clean, %d batches clean (no crash)" % summary.get("batches", 0))
+          elif summary.get("batches", 0):
+              print("VERDICT: pipeline VALID — batch event captured (see journal); inspect artifact")
+          else:
+              print("VERDICT: FUZZ LOOP DID NOT RUN — inspect artifact")
+              raise SystemExit(1)
+          PY
