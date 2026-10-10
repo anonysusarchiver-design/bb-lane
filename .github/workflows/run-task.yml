@@ -1,0 +1,77 @@
+# bb-lane — fresh-IP task runner (v1)
+#
+# Executes ONE sanitized network task envelope on a fresh GitHub-hosted runner
+# (new egress IP per run) and returns the result to the operator's local relay
+# (encrypted end-to-end: RSA-OAEP-256 + AES-256-GCM with an ephemeral per-task
+# keypair; the relay itself never sees plaintext).
+#
+# No repository secrets are used. The dispatch carries:
+#   - the current relay URL (cloudflared quick tunnel)          [rotation-immune]
+#   - a single-use, TTL-bound task token (x-task-token)         [leak-safe]
+#   - an ephemeral RSA public key (result encryption)           [privacy]
+# The permanent operator token is NEVER transmitted to, or stored in, this repo.
+#
+# Backup channel: the encrypted payload is also uploaded as a 1-day artifact, so
+# a rotated tunnel never loses a result.
+#
+# Task types: fetch | dns | portcheck | http_probe  (read-only, rate-limited, capped)
+name: bb-lane
+run-name: bb-lane ${{ github.event.inputs.task_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: "task id"
+        required: true
+      task_json:
+        description: "sanitized task envelope JSON"
+        required: true
+      relay_url:
+        description: "local relay base URL (current quick tunnel)"
+        required: true
+      task_token:
+        description: "single-use task token"
+        required: true
+      artifact_pubkey:
+        description: "ephemeral RSA public key (PEM) for result encryption"
+        required: true
+
+concurrency:
+  group: bb-lane-${{ github.event.inputs.task_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Mask task token in all logs
+        run: echo "::add-mask::${{ github.event.inputs.task_token }}"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned deps
+        run: pip install -r runner/requirements.txt
+      - name: Run lane task
+        env:
+          TASK_ID: ${{ github.event.inputs.task_id }}
+          TASK_JSON: ${{ github.event.inputs.task_json }}
+          RELAY_URL: ${{ github.event.inputs.relay_url }}
+          TASK_TOKEN: ${{ github.event.inputs.task_token }}
+          ARTIFACT_PUBKEY: ${{ github.event.inputs.artifact_pubkey }}
+        run: python3 runner/lane_runner.py
+      - name: Upload encrypted result artifact (backup channel)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lane-result-${{ github.event.inputs.task_id }}
+          path: lane-out/
+          retention-days: 1
+          if-no-files-found: warn
