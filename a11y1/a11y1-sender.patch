@@ -1,0 +1,33 @@
+diff --git a/accessible/generic/LocalAccessible.cpp b/accessible/generic/LocalAccessible.cpp
+index 3997019b..ed66c09e 100644
+--- a/accessible/generic/LocalAccessible.cpp
++++ b/accessible/generic/LocalAccessible.cpp
+@@ -902,10 +902,27 @@ nsresult LocalAccessible::HandleAccEvent(AccEvent* aEvent) {
+           ipcDoc->ShowEvent(downcast_accEvent(aEvent));
+           break;
+ 
+-        case nsIAccessibleEvent::EVENT_HIDE:
++        case nsIAccessibleEvent::EVENT_HIDE: {
++          // A11Y-1 FORGE BEGIN (test-only repro harness; remove before
++          // filing upstream). For the marked element, forge the wire
++          // sequence of a move (AccessiblesWillMove followed by two Hide
++          // events in one batch) to reach the missing detached-root guard
++          // in DocAccessibleParent::ProcessHideEvent.
++          nsString a11y1ForgeId;
++          if (HasOwnContent() && mContent->IsElement() &&
++              mContent->AsElement()->GetAttr(nsGkAtoms::id, a11y1ForgeId) &&
++              a11y1ForgeId.EqualsLiteral("a11y1-forge")) {
++            nsTArray<uint64_t> a11y1WillMoveIds;
++            a11y1WillMoveIds.AppendElement(id);
++            ipcDoc->SendAccessiblesWillMove(a11y1WillMoveIds);
++            ipcDoc->PushMutationEventData(
++                HideEventData{id, aEvent->IsFromUserInput()});
++          }
++          // A11Y-1 FORGE END.
+           ipcDoc->PushMutationEventData(
+               HideEventData{id, aEvent->IsFromUserInput()});
+           break;
++        }
+ 
+         case nsIAccessibleEvent::EVENT_INNER_REORDER:
+         case nsIAccessibleEvent::EVENT_REORDER:
