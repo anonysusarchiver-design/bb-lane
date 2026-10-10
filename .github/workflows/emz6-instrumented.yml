@@ -121,7 +121,7 @@ jobs:
         run: |
           ulimit -c 0 || true
           python3 - <<'PY'
-          import json, os, subprocess, time
+          import json, os, re, subprocess, time
           JS = os.path.abspath("jsshell-source/js")
           tasks = json.load(open("emz6-tasks.json"))
           os.makedirs("out/runs", exist_ok=True)
@@ -149,13 +149,19 @@ jobs:
                   fn = "out/runs/%s-%02d.txt" % (name, i)
                   with open(fn, "wb") as f:
                       f.write(out)
-                  markers = [ln.decode("utf8", "replace")
-                             for ln in out.splitlines() if b"EMZ6-PROBE" in ln][:3]
+                  fams = set()
+                  markers = []
+                  for ln in out.splitlines():
+                      m = re.search(rb"EMZ6-PROBE (SELFTEST|P0|P1|P2)", ln)
+                      if m:
+                          fams.add(m.group(1).decode())
+                          if len(markers) < 3:
+                              markers.append(ln.decode("utf8", "replace"))
                   last = out.decode("utf8", "replace").splitlines()[-3:]
                   row = {"task": name, "run": i, "rc": rc, "secs": dt,
                          "args": t.get("args", ""), "env": env_extra,
-                         "probe": bool(markers), "markers": markers, "file": fn,
-                         "tail": last}
+                         "probe": bool(fams), "fams": sorted(fams),
+                         "markers": markers, "file": fn, "tail": last}
                   summary.append(row)
                   print(json.dumps(row))
           json.dump(summary, open("out/run-summary.json", "w"), indent=1)
@@ -200,13 +206,21 @@ jobs:
           python3 - <<'PY'
           import json, sys
           s = json.load(open("out/run-summary.json"))
-          sel = [r for r in s if r["task"] == "selftest"]
-          if not sel or not sel[0]["probe"]:
+          sel = [r for r in s if r["task"] == "selftest" and "SELFTEST" in r.get("fams", [])]
+          if not sel:
               print("VERDICT: PROBE PIPELINE INVALID - selftest did not fire; do not trust negatives")
               sys.exit(1)
-          hits = [r for r in s if r["probe"] and r["task"] != "selftest"]
-          print("VERDICT: selftest fired (pipeline OK); battery runs=%d probe-hits=%d" % (len(s), len(hits)))
-          for h in hits:
-              print("  HIT %s run %s: %s" % (h["task"], h["run"], " | ".join(h["markers"])))
+          p0 = sorted({r["task"] for r in s if "P0" in r.get("fams", [])})
+          gc = sorted({(r["task"], r["run"]) for r in s
+                       if ("P1" in r.get("fams", []) or "P2" in r.get("fams", []))})
+          print("VERDICT: selftest fired (pipeline OK); battery runs=%d" % len(s))
+          print("  P0 map-miss tasks: %s" % (p0 or "none"))
+          print("  GC-consumer probe hits: %s" % (gc or "none"))
+          if gc:
+              print("=> GAP CONFIRMED: GC consumer skipped a trapping wasm frame")
+          elif p0:
+              print("=> MAP-MISS CONFIRMED at trap; GC-consumer reachability not observed")
+          else:
+              print("=> no trap/miss observed in battery (inspect run outputs)")
           sys.exit(0)
           PY
