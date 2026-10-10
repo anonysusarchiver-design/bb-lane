@@ -1,0 +1,212 @@
+# bb-lane — emz6 instrumented jsshell build + task battery (E-MZ-6).
+#
+# Builds a SpiderMonkey js shell from the public mirror with a caller-supplied
+# instrumentation patch applied before `./mach build`, verifies the probe is in
+# the built binary, then runs a caller-supplied task battery under that shell
+# (each task: name, base64/z script, args, repeat count, extra env).
+#
+# Public content only: no secrets, no repo-sourced data, read-only public fetches.
+# The patch is a unified diff relative to the mirror's default branch; it is
+# applied with `git apply -p1` inside build-jsshell.sh (a failed apply aborts).
+name: emz6-instrumented
+run-name: emz6-instrumented ${{ github.event.inputs.name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "run label (a-z0-9-, used in the run title)"
+        required: false
+        default: "emz6"
+      patch_b64:
+        description: "instrumentation patch, base64 (optionally `z:`+base64(zlib(data)))"
+        required: true
+      tasks_b64:
+        description: "task battery JSON [{name,script(b64|z:),args?,runs?,env?}], base64 (or z:)"
+        required: true
+      build_flags:
+        description: "configure flags for the source build"
+        required: false
+        default: "--enable-debug"
+      timeout_min:
+        description: "job timeout minutes (5-350; debug build + battery needs ~60-180)"
+        required: false
+        default: "300"
+
+concurrency:
+  group: emz6-instrumented
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  instrumented:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_min || '300') }}
+    env:
+      BUILD_FLAGS: ${{ github.event.inputs.build_flags || '--enable-debug' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Runner + toolchain probe
+        run: |
+          set -x
+          date -u
+          uname -a
+          nproc
+          free -h | head -2
+          df -h / | tail -1
+          (clang --version | head -2) || echo "clang: absent"
+          python3 --version
+
+      - name: Decode instrumentation patch + task battery
+        env:
+          PATCH_B64: ${{ github.event.inputs.patch_b64 }}
+          TASKS_B64: ${{ github.event.inputs.tasks_b64 }}
+        run: |
+          python3 - <<'PY'
+          import base64, os, zlib, json
+          def dec(s):
+              if s.startswith("z:"):
+                  return zlib.decompress(base64.b64decode(s[2:]))
+              return base64.b64decode(s)
+          patch = dec(os.environ["PATCH_B64"])
+          open("emz6-probe.patch", "wb").write(patch)
+          tasks = json.loads(dec(os.environ["TASKS_B64"]).decode())
+          for t in tasks:
+              data = dec(t["script"])
+              with open("emz6-task-%s.js" % t["name"], "wb") as f:
+                  f.write(data)
+          json.dump(tasks, open("emz6-tasks.json", "w"), indent=1)
+          print("patch bytes:", len(patch))
+          print("tasks:", [(t["name"], t.get("runs", 1), t.get("args", "")) for t in tasks])
+          PY
+          sha256sum emz6-probe.patch
+
+      - name: Build instrumented shell (patch -> mach build)
+        id: build
+        timeout-minutes: 280
+        run: |
+          set -o pipefail
+          bash emz5/build-jsshell.sh "$BUILD_FLAGS" "$PWD/emz6-probe.patch" 2>&1 | tee emz6-build.log
+
+      - name: Verify probe present in built binary
+        if: steps.build.outcome == 'success'
+        run: |
+          set -x
+          mkdir -p out
+          ls -l jsshell-source/js
+          sha256sum jsshell-source/js | tee out/built-binary-sha256.txt
+          "$PWD/jsshell-source/js" --version | tee out/built-version.txt
+          grep -a -o "EMZ6-PROBE [A-Z0-9:]*" jsshell-source/js | sort | uniq -c > out/probe-markers-binary.txt || true
+          cat out/probe-markers-binary.txt
+          test -s out/probe-markers-binary.txt || { echo "BINARY-ERROR: EMZ6-PROBE markers not found in built shell"; exit 1; }
+          mkdir -p out/patched-src
+          cp mc/js/src/wasm/WasmInstance.cpp out/patched-src/
+          cp mc/js/src/wasm/WasmFrameIter.h out/patched-src/
+          cp mc/js/src/wasm/WasmFrameIter.cpp out/patched-src/
+          cp emz6-probe.patch out/
+          cp emz6-task-*.js out/ 2>/dev/null || true
+          cp jsshell-patch-sha256.txt out/ 2>/dev/null || true
+          cp jsshell-probe-markers.txt out/ 2>/dev/null || true
+          cp jsshell-source-rev.txt out/ 2>/dev/null || true
+          tail -2000 emz6-build.log > out/emz6-build-tail.txt
+
+      - name: Run task battery under instrumented shell
+        id: battery
+        if: steps.build.outcome == 'success'
+        run: |
+          ulimit -c 0 || true
+          python3 - <<'PY'
+          import json, os, subprocess, time
+          JS = os.path.abspath("jsshell-source/js")
+          tasks = json.load(open("emz6-tasks.json"))
+          os.makedirs("out/runs", exist_ok=True)
+          summary = []
+          for t in tasks:
+              name = t["name"]
+              script = "emz6-task-%s.js" % name
+              args = (t.get("args") or "").split()
+              runs = int(t.get("runs") or 1)
+              env_extra = t.get("env") or {}
+              for i in range(1, runs + 1):
+                  env = dict(os.environ)
+                  env.update({k: str(v) for k, v in env_extra.items()})
+                  t0 = time.time()
+                  try:
+                      p = subprocess.run(["timeout", "1800", JS, *args, script],
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         timeout=1900, env=env)
+                      rc = p.returncode
+                      out = p.stdout
+                  except subprocess.TimeoutExpired as e:
+                      rc = "TIMEOUT"
+                      out = e.stdout or b""
+                  dt = round(time.time() - t0, 2)
+                  fn = "out/runs/%s-%02d.txt" % (name, i)
+                  with open(fn, "wb") as f:
+                      f.write(out)
+                  markers = [ln.decode("utf8", "replace")
+                             for ln in out.splitlines() if b"EMZ6-PROBE" in ln][:3]
+                  last = out.decode("utf8", "replace").splitlines()[-3:]
+                  row = {"task": name, "run": i, "rc": rc, "secs": dt,
+                         "args": t.get("args", ""), "env": env_extra,
+                         "probe": bool(markers), "markers": markers, "file": fn,
+                         "tail": last}
+                  summary.append(row)
+                  print(json.dumps(row))
+          json.dump(summary, open("out/run-summary.json", "w"), indent=1)
+          PY
+
+      - name: Assemble evidence
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "{"
+            echo "  \"run_id\": \"$GITHUB_RUN_ID\","
+            echo "  \"run_url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\","
+            echo "  \"commit\": \"$GITHUB_SHA\","
+            echo "  \"name\": \"${{ github.event.inputs.name }}\","
+            echo "  \"build_flags\": \"$BUILD_FLAGS\","
+            echo "  \"date_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+            echo "  \"source_rev\": \"$(cat jsshell-source-rev.txt 2>/dev/null || echo unknown)\""
+            echo "}"
+          } > out/meta.json
+          cat out/meta.json
+          ls -l out/ out/runs 2>/dev/null || true
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emz6-instrumented-evidence
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Verdict
+        if: always()
+        run: |
+          B="${{ steps.build.outcome }}"
+          echo "build=$B"
+          if [ "$B" != "success" ]; then
+            echo "VERDICT: instrumented build failed (see emz6-build-tail.txt)"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, sys
+          s = json.load(open("out/run-summary.json"))
+          sel = [r for r in s if r["task"] == "selftest"]
+          if not sel or not sel[0]["probe"]:
+              print("VERDICT: PROBE PIPELINE INVALID - selftest did not fire; do not trust negatives")
+              sys.exit(1)
+          hits = [r for r in s if r["probe"] and r["task"] != "selftest"]
+          print("VERDICT: selftest fired (pipeline OK); battery runs=%d probe-hits=%d" % (len(s), len(hits)))
+          for h in hits:
+              print("  HIT %s run %s: %s" % (h["task"], h["run"], " | ".join(h["markers"])))
+          sys.exit(0)
+          PY
