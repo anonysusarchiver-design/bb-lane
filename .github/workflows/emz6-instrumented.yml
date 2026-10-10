@@ -152,7 +152,7 @@ jobs:
                   fams = set()
                   markers = []
                   for ln in out.splitlines():
-                      m = re.search(rb"EMZ6-PROBE (SELFTEST|P0|P1|P2)", ln)
+                      m = re.search(rb"EMZ6-PROBE ([A-Z0-9]+):", ln)
                       if m:
                           fams.add(m.group(1).decode())
                           if len(markers) < 3:
@@ -214,6 +214,7 @@ jobs:
           gc = sorted({(r["task"], r["run"]) for r in s
                        if ("P1" in r.get("fams", []) or "P2" in r.get("fams", []))})
           print("VERDICT: selftest fired (pipeline OK); battery runs=%d" % len(s))
+          print("  families seen: %s" % sorted({f for r in s for f in r.get("fams", [])}))
           print("  P0 map-miss tasks: %s" % (p0 or "none"))
           print("  GC-consumer probe hits: %s" % (gc or "none"))
           if gc:
