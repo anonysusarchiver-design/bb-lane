@@ -118,9 +118,11 @@ jobs:
           for f in emz5-prebuilt-fetch.log emz5-prebuilt-smoke.log emz5-built-smoke.log \
                    emz5-prebuilt-version.txt emz5-built-version.txt \
                    emz5-prebuilt-smoke-output.txt emz5-built-smoke-output.txt \
-                   emz5-source-rev.txt; do
+                   jsshell-source-rev.txt; do
             [ -f "$f" ] && cp "$f" out/ || true
           done
+          [ -f jsshell/js-path.txt ] && cp jsshell/js-path.txt out/prebuilt-js-path.txt || true
+          [ -f jsshell-source/js-path.txt ] && cp jsshell-source/js-path.txt out/built-js-path.txt || true
           [ -f emz5/smoke.js ] && cp emz5/smoke.js out/ || true
           [ -f emz5-build.log ] && tail -300 emz5-build.log > out/emz5-build-tail.txt || true
           {
