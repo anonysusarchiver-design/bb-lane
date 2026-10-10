@@ -1,0 +1,17 @@
+diff --git a/accessible/ipc/DocAccessibleParent.cpp b/accessible/ipc/DocAccessibleParent.cpp
+index 2ae68a9d..82cba8be 100644
+--- a/accessible/ipc/DocAccessibleParent.cpp
++++ b/accessible/ipc/DocAccessibleParent.cpp
+@@ -479,6 +479,12 @@ mozilla::ipc::IPCResult DocAccessibleParent::ProcessHideEvent(
+   }
+ 
+   RemoteAccessible* parent = root->RemoteParent();
++  // A11Y-1 FIX-PROBE BEGIN (guard under test; mirrors the missing check that
++  // lets a forged move+Hide,Hide sequence null-deref on the second hide).
++  if (!parent) {
++    return IPC_FAIL(this, "hide for detached accessible");
++  }
++  // A11Y-1 FIX-PROBE END.
+   {
+     // Scope for PerfStats
+     AUTO_PROFILER_MARKER_TEXT("a11y::PlatformShowHideEvent", A11Y, {}, ""_ns);
