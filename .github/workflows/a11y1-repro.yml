@@ -1,0 +1,165 @@
+# bb-lane — a11y1-repro: live parent-process SEGV repro for A11Y-1 (missing
+# detached-root guard in DocAccessibleParent::ProcessHideEvent, mozilla-central
+# pinned rev e00a7636053d44c48b523c20b24fde9d3548062a).
+#
+# ARM 1: OPT browser built from the pinned mirror + test-only sender/test
+#        patches (forge AccessiblesWillMove + Hide,Hide on one element).
+#        5x mochitest-plain runs; expectation: parent-process SEGV 5/5.
+# ARM 2: production guard probe (IPC_FAIL on detached parent) applied +
+#        incremental rebuild; 1 run; expectation: guard fires, parent survives.
+#
+# Public content only: no secrets, read-only public fetches.
+name: a11y1-repro
+run-name: a11y1-repro ${{ github.event.inputs.name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "run label (a-z0-9-, used in the run title)"
+        required: false
+        default: "a11y1"
+      source_rev:
+        description: "mirror commit to pin"
+        required: false
+        default: "e00a7636053d44c48b523c20b24fde9d3548062a"
+      timeout_min:
+        description: "job timeout minutes (5-355)"
+        required: false
+        default: "355"
+
+concurrency:
+  group: a11y1-repro
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_min || '355') }}
+    env:
+      SRC_REV: ${{ github.event.inputs.source_rev }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Runner probe
+        run: |
+          set -x
+          date -u
+          uname -a
+          nproc
+          free -h | head -2
+          df -h / | tail -1
+          python3 --version
+          echo "SRC_REV=$SRC_REV"
+
+      - name: Build browser (pin + sender/test patches + mach OPT build)
+        id: build
+        timeout-minutes: 265
+        run: |
+          set -o pipefail
+          bash a11y1/build-browser.sh "$SRC_REV" 2>&1 | tee a11y1-build.log
+
+      - name: Snapshot patched sources + patches
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p out/patched-src
+          sed -n '895,930p' mc/accessible/generic/LocalAccessible.cpp > out/patched-src/LocalAccessible-EVENT_HIDE.txt
+          sed -n '470,505p' mc/accessible/ipc/DocAccessibleParent.cpp > out/patched-src/DocAccessibleParent-ProcessHideEvent.txt
+          cp mc/testing/mochitest/tests/Harness_sanity/a11y1_forge.html out/patched-src/
+          cp mc/testing/mochitest/tests/Harness_sanity/mochitest.toml out/patched-src/
+          cp a11y1/a11y1-sender.patch a11y1/a11y1-test.patch a11y1/a11y1-fix.patch out/
+          sha256sum out/*.patch | tee out/patches-sha256.txt
+          mc/obj-a11y1/dist/bin/firefox --version | tee out/built-version.txt || true
+          sha256sum mc/obj-a11y1/dist/bin/firefox | tee out/built-binary-sha256.txt
+          du -sh mc/obj-a11y1/dist/bin 2>/dev/null || true
+
+      - name: ARM 1 — 5x crash runs (expect parent SEGV 5/5)
+        id: arm1
+        if: steps.build.outcome == 'success'
+        timeout-minutes: 40
+        run: |
+          set -o pipefail
+          bash a11y1/run-arm1.sh 2>&1 | tee a11y1-arm1.log
+
+      - name: ARM 2 — guard probe + incremental rebuild + 1 clean run
+        id: arm2
+        if: steps.build.outcome == 'success'
+        timeout-minutes: 70
+        run: |
+          set -o pipefail
+          bash a11y1/run-arm2.sh 2>&1 | tee a11y1-arm2.log
+
+      - name: Assemble evidence
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "{"
+            echo "  \"run_id\": \"$GITHUB_RUN_ID\","
+            echo "  \"run_url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\","
+            echo "  \"commit\": \"$GITHUB_SHA\","
+            echo "  \"name\": \"${{ github.event.inputs.name }}\","
+            echo "  \"source_rev\": \"$SRC_REV\","
+            echo "  \"build_outcome\": \"${{ steps.build.outcome }}\","
+            echo "  \"arm1_outcome\": \"${{ steps.arm1.outcome }}\","
+            echo "  \"arm2_outcome\": \"${{ steps.arm2.outcome }}\","
+            echo "  \"date_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            echo "}"
+          } > out/meta.json
+          cp a11y1-build.log a11y1-arm1.log a11y1-arm2.log out/ 2>/dev/null || true
+          cat out/meta.json
+          find out -maxdepth 3 -type f | sort | head -100 || true
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11y1-repro-evidence
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Verdict
+        if: always()
+        run: |
+          B="${{ steps.build.outcome }}"
+          A1="${{ steps.arm1.outcome }}"
+          A2="${{ steps.arm2.outcome }}"
+          echo "outcomes: build=$B arm1=$A1 arm2=$A2"
+          if [ "$B" != "success" ]; then
+            echo "VERDICT: BUILD-STAGE-INCOMPLETE — see a11y1-build.log in the artifact"
+            exit 1
+          fi
+          if [ ! -s out/arm1/result.txt ]; then
+            echo "VERDICT: ARM1-NO-RESULT — see a11y1-arm1.log"
+            exit 1
+          fi
+          cat out/arm1/result.txt
+          CRASHES=$(sed -n 's|^crashes=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+          FRAMES=$(sed -n 's|^frames=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+          echo "ARM1: crashes=$CRASHES frames=$FRAMES /5"
+          if [ "${CRASHES:-0}" != "5" ]; then
+            echo "VERDICT: REPRO NOT CONFIRMED ($CRASHES/5 parent crashes) — inspect run logs/cores"
+            exit 1
+          fi
+          echo "ARM1 CONFIRMED: parent-process SEGV in 5/5 runs"
+          if [ ! -s out/arm2/result.txt ]; then
+            echo "VERDICT: ARM1 confirmed; ARM2-NO-RESULT (fix-probe run missing) — see a11y1-arm2.log"
+            exit 1
+          fi
+          cat out/arm2/result.txt
+          if grep -q "parent_crash=yes" out/arm2/result.txt; then
+            echo "VERDICT: REPRO CONFIRMED but GUARD FALSIFIED (parent crashed with guard applied)"
+            exit 1
+          fi
+          if grep -q "guard_fired=yes" out/arm2/result.txt; then
+            echo "VERDICT: REPRO CONFIRMED + GUARD HOLDS (IPC_FAIL rejected the forged hide; parent survived)"
+            exit 0
+          fi
+          echo "VERDICT: ARM1 confirmed; ARM2 INCONCLUSIVE (guard marker not observed) — inspect arm2 logs"
+          exit 1
