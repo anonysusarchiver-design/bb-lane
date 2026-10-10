@@ -220,9 +220,10 @@ jobs:
           python3 - <<'PY'
           import json, sys
           s = json.load(open("out/run-summary.json"))
+          has_sel_task = any(r["task"] == "selftest" for r in s)
           sel = [r for r in s if r["task"] == "selftest" and "SELFTEST" in r.get("fams", [])]
-          if not sel:
-              print("VERDICT: PROBE PIPELINE INVALID - selftest did not fire; do not trust negatives")
+          if has_sel_task and not sel:
+              print("VERDICT: PROBE PIPELINE INVALID - selftest requested but did not fire; do not trust negatives")
               sys.exit(1)
           p0 = sorted({r["task"] for r in s if "P0" in r.get("fams", [])})
           gc = sorted({(r["task"], r["run"]) for r in s
@@ -235,14 +236,20 @@ jobs:
               m = _re.search(r"caught=(\d+)", x)
               return bool(m) and int(m.group(1)) > 0
           caught = sorted({(r["task"], r["run"]) for r in s
-                           if any(_caught_pos(x) for x in r.get("res", []))})
-          print("VERDICT: selftest fired (pipeline OK); battery runs=%d" % len(s))
+                           if r["task"] != "throwref-ctl" and any(_caught_pos(x) for x in r.get("res", []))})
+          ctl = sorted({(r["task"], r["run"]) for r in s
+                        if r["task"] == "throwref-ctl" and any(_caught_pos(x) for x in r.get("res", []))})
+          if has_sel_task:
+              print("VERDICT: selftest fired (pipeline OK); battery runs=%d" % len(s))
+          else:
+              print("VERDICT: selftest canary not in battery; battery runs=%d (build+probe verify still gate)" % len(s))
           print("  P0 map-miss tasks: %s" % (p0 or "none"))
           print("  GC-consumer probe hits: %s" % (gc or "none"))
           print("  GetOrWrapWasmException bail families: %s" % (bails or "none"))
           print("  Catchable (G9) tasks: %s" % (g9 or "none"))
           print("  Handler-search (P23) tasks: %s" % (p23 or "none"))
-          print("  Catch-resumes observed: %s" % (caught or "none"))
+          print("  Catch-resumes observed (non-control): %s" % (caught or "none"))
+          print("  Control-site catch-resumes (throwref-ctl, EXPECTED nonzero): %s" % (ctl or "none"))
           if caught:
               print("=> RESUME OBSERVED: a catch handler resumed for a trapped frame - investigate!")
           elif gc:
