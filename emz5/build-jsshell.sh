@@ -8,12 +8,16 @@
 #   top-level `./mach build`. (js/src/mach no longer exists; the old
 #   `cd js/src && ./mach build` flow fails with "No such file or directory".)
 #
-# usage: build-jsshell.sh [configure-flags-string]
+# usage: build-jsshell.sh [configure-flags-string] [patch-file]
 #   default flags: --disable-debug --enable-optimize
 #   fuzzing flavor: --enable-fuzzing --enable-address-sanitizer --disable-debug
+#   patch-file (optional): unified diff applied to the clone with `git apply -p1`
+#     before configure/build. Intended for research instrumentation builds
+#     (E-MZ-6 probe); a failed apply aborts the build loudly.
 set -euo pipefail
 
 FLAGS="${1:---disable-debug --enable-optimize}"
+PATCH_FILE="${2:-}"
 WORK="$(pwd)"
 OBJDIR_NAME="obj-emz5"
 
@@ -32,6 +36,18 @@ sudo apt-get install -y -qq clang lld m4 autoconf2.13 zlib1g-dev
 echo "== clone mozilla-central (shallow, public GitHub mirror) =="
 git clone --depth 1 https://github.com/mozilla-firefox/firefox.git mc
 git -C mc rev-parse HEAD | tee "$WORK/jsshell-source-rev.txt"
+
+if [ -n "$PATCH_FILE" ]; then
+  echo "== applying instrumentation patch: $PATCH_FILE =="
+  sha256sum "$PATCH_FILE" | tee "$WORK/jsshell-patch-sha256.txt"
+  if ! git -C mc apply --verbose "$PATCH_FILE"; then
+    echo "PATCH-ERROR: git apply failed for $PATCH_FILE (mirror drift?)"
+    exit 3
+  fi
+  echo "== probe markers present in patched tree: =="
+  grep -rn "EMZ6-PROBE" mc/js/src/wasm/ | tee "$WORK/jsshell-probe-markers.txt"
+  echo "== patch applied OK =="
+fi
 
 echo "== MOZCONFIG (project=js; flags: $FLAGS) =="
 mkdir -p "$HOME/mozconfigs"
