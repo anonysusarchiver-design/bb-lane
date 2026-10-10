@@ -411,7 +411,9 @@ def main():
         "duration_ms": result["duration_ms"],
         "runner_ip": result["runner"]["egress_ip"], "run_url": RUN_URL,
         "artifact_enc": "rsa-oaep-sha256/aes-256-gcm",
-        "delivered_over_relay": False,
+        # null at send time: the relay only ever receives the attempt (its receipt = delivered);
+        # the artifact meta.json carries the final verdict.
+        "delivered_over_relay": None,
     }
     try:
         enc = encrypt_envelope(plain, ARTIFACT_PUBKEY)
