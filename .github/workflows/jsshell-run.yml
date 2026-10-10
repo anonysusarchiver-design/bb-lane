@@ -1,0 +1,149 @@
+# bb-lane — emz5 jsshell run (generic dynamic-verification harness).
+#
+# Runs a caller-supplied JS script under a freshly obtained jsshell:
+#   route a: public prebuilt jsshell zip (fast, default)
+#   route b: source build fallback if no prebuilt works (slow, ~60-120 min)
+# Outputs (stdout/stderr, js version, exit code, the script) go to a small
+# artifact. Scripts are transported base64 in the dispatch input — inputs on a
+# public repo are publicly visible, so scripts must be sanitized/public content;
+# keep them <= ~40 KB (or zlib-compress and prefix `z:`).
+name: emz5-jsshell-run
+run-name: emz5-run ${{ github.event.inputs.name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "run label (a-z0-9-, used in the run title)"
+        required: false
+        default: "adhoc"
+      script_b64:
+        description: "JS script, base64 (optionally `z:`+base64(zlib(data)))"
+        required: true
+      script_name:
+        description: "script filename inside the run"
+        required: false
+        default: "task.js"
+      args:
+        description: "extra js shell args (optional, word-split)"
+        required: false
+        default: ""
+      source_url:
+        description: "optional explicit jsshell zip URL"
+        required: false
+        default: ""
+      build_flags:
+        description: "configure flags for source-build fallback"
+        required: false
+        default: "--disable-debug --enable-optimize"
+      timeout_min:
+        description: "job timeout minutes (1-350)"
+        required: false
+        default: "15"
+
+concurrency:
+  group: emz5-run-${{ github.event.inputs.name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_min || '15') }}
+    env:
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch jsshell (prebuilt)
+        id: fetch
+        continue-on-error: true
+        run: bash emz5/fetch-jsshell.sh jsshell "${{ github.event.inputs.source_url }}" | tee emz5-run-fetch.log
+
+      - name: Build from source (fallback)
+        id: build
+        if: steps.fetch.outcome != 'success'
+        timeout-minutes: 140
+        run: |
+          set -o pipefail
+          bash emz5/build-jsshell.sh "${{ github.event.inputs.build_flags }}" 2>&1 | tee emz5-run-build.log
+
+      - name: Decode task script
+        id: decode
+        if: steps.fetch.outcome == 'success' || steps.build.outcome == 'success'
+        env:
+          SCRIPT_B64: ${{ github.event.inputs.script_b64 }}
+          SCRIPT_NAME: ${{ github.event.inputs.script_name }}
+        run: |
+          python3 - <<'PY'
+          import base64, os, zlib
+          b64 = os.environ["SCRIPT_B64"]
+          name = os.environ.get("SCRIPT_NAME") or "task.js"
+          if b64.startswith("z:"):
+              data = zlib.decompress(base64.b64decode(b64[2:]))
+          else:
+              data = base64.b64decode(b64)
+          with open(name, "wb") as f:
+              f.write(data)
+          print("decoded %s: %d bytes" % (name, len(data)))
+          PY
+
+      - name: Run script under jsshell
+        id: runjs
+        if: steps.decode.outcome == 'success'
+        continue-on-error: true
+        env:
+          RUN_ARGS: ${{ github.event.inputs.args }}
+          SCRIPT_NAME: ${{ github.event.inputs.script_name }}
+        run: |
+          set -u
+          if [ -f jsshell/js-path.txt ]; then JS=$(head -1 jsshell/js-path.txt); else JS=$(head -1 jsshell-source/js-path.txt); fi
+          case "$JS" in /*) ;; *) JS="$(pwd)/$JS" ;; esac
+          echo "js binary: $JS"
+          timeout 30 "$JS" --version < /dev/null > emz5-run-version.txt 2>&1 || true
+          cat emz5-run-version.txt
+          set +e
+          # shellcheck disable=SC2086
+          timeout 18000 "$JS" $RUN_ARGS "$SCRIPT_NAME" > emz5-run-output.txt 2>&1
+          RC=$?
+          echo "exit_code=$RC" | tee emz5-run-exit.txt
+          echo "---- output head ----"
+          head -100 emz5-run-output.txt
+          echo "---- output tail ----"
+          tail -20 emz5-run-output.txt
+          {
+            echo "## emz5 jsshell run: ${{ github.event.inputs.name }}"
+            echo ""
+            echo '```'
+            cat emz5-run-version.txt
+            echo '```'
+            echo "exit_code: \`$RC\`"
+          } >> "$GITHUB_STEP_SUMMARY" || true
+          exit $RC
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emz5-run-output
+          path: |
+            emz5-run-*.txt
+            *.js
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Verdict
+        if: always()
+        run: |
+          R="${{ steps.runjs.outcome }}"
+          echo "runjs=$R"
+          if [ "$R" = "success" ]; then
+            echo "VERDICT: script ran cleanly"
+          else
+            echo "VERDICT: script run did not succeed (see output artifact)"
+            exit 1
+          fi

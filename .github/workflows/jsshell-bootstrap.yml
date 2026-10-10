@@ -1,0 +1,184 @@
+# bb-lane — emz5 jsshell bootstrap (E-MZ-5a).
+#
+# Obtain a working SpiderMonkey shell (jsshell) on a fresh runner, for later
+# dynamic verification + fuzzing tasks:
+#   route a: public prebuilt jsshell zips (archive.mozilla.org / taskcluster fuzzing builds)
+#   route b: build js/src from the public GitHub mirror (shallow clone + mach)
+# Evidence (version output, smoke output, probes, route meta) is uploaded as a
+# small text artifact; when built from source, the shell itself is kept too.
+#
+# Public content only: no secrets, no repo-sourced data, read-only public fetches.
+# NOTE: this is a build/measure job — the 15-min cap of run-task.yml does NOT apply;
+# the job timeout is dispatch-controlled (see timeout_min input).
+name: emz5-jsshell-bootstrap
+run-name: emz5-bootstrap ${{ github.event.inputs.mode }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "verify (prebuilt only) | build (source only) | auto (prebuilt then build fallback)"
+        required: false
+        default: "auto"
+      source_url:
+        description: "optional explicit jsshell zip URL (overrides discovery order)"
+        required: false
+        default: ""
+      build_flags:
+        description: "configure flags for the source build"
+        required: false
+        default: "--disable-debug --enable-optimize"
+      timeout_min:
+        description: "job timeout minutes (5-350; build fallback needs ~60-120)"
+        required: false
+        default: "150"
+
+concurrency:
+  group: emz5-bootstrap
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_min || '150') }}
+    env:
+      MODE: ${{ github.event.inputs.mode || 'auto' }}
+      SOURCE_URL: ${{ github.event.inputs.source_url }}
+      BUILD_FLAGS: ${{ github.event.inputs.build_flags || '--disable-debug --enable-optimize' }}
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Runner + toolchain probe
+        run: |
+          set -x
+          date -u
+          uname -a
+          nproc
+          free -h | head -2
+          df -h / | tail -1
+          (clang --version | head -2) || echo "clang: absent"
+          (gcc --version | head -1) || echo "gcc: absent"
+          python3 --version
+          (rustc --version) || echo "rustc: absent"
+          curl --version | head -1
+
+      - name: Prebuilt route — discovery + download
+        id: prebuilt
+        if: ${{ (github.event.inputs.mode || 'auto') != 'build' }}
+        continue-on-error: true
+        run: bash emz5/fetch-jsshell.sh jsshell "$SOURCE_URL" | tee emz5-prebuilt-fetch.log
+
+      - name: Smoke — prebuilt shell
+        id: smoke_prebuilt
+        if: steps.prebuilt.outcome == 'success'
+        continue-on-error: true
+        run: bash emz5/smoke-run.sh jsshell prebuilt | tee emz5-prebuilt-smoke.log
+
+      - name: Decide route
+        id: route
+        if: always()
+        run: |
+          mkdir -p out
+          S1="${{ steps.smoke_prebuilt.outcome }}"
+          if [ "$S1" = "success" ] && [ "$MODE" != "build" ]; then
+            ROUTE="prebuilt"; BUILD_NEEDED=false
+          elif [ "$MODE" = "verify" ]; then
+            ROUTE="prebuilt-failed"; BUILD_NEEDED=false
+          else
+            ROUTE="source-build"; BUILD_NEEDED=true
+          fi
+          echo "route=$ROUTE build_needed=$BUILD_NEEDED"
+          echo "$ROUTE" > out/route-name.txt
+          echo "build_needed=$BUILD_NEEDED" >> "$GITHUB_OUTPUT"
+
+      - name: Build from source (fallback / explicit)
+        id: build
+        if: steps.route.outputs.build_needed == 'true'
+        timeout-minutes: 140
+        run: |
+          set -o pipefail
+          bash emz5/build-jsshell.sh "$BUILD_FLAGS" 2>&1 | tee emz5-build.log
+
+      - name: Smoke — built shell
+        id: smoke_built
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: bash emz5/smoke-run.sh jsshell-source built | tee emz5-built-smoke.log
+
+      - name: Assemble evidence
+        if: always()
+        run: |
+          mkdir -p out
+          for f in emz5-prebuilt-fetch.log emz5-prebuilt-smoke.log emz5-built-smoke.log \
+                   emz5-prebuilt-version.txt emz5-built-version.txt \
+                   emz5-prebuilt-smoke-output.txt emz5-built-smoke-output.txt \
+                   emz5-source-rev.txt; do
+            [ -f "$f" ] && cp "$f" out/ || true
+          done
+          [ -f emz5/smoke.js ] && cp emz5/smoke.js out/ || true
+          [ -f emz5-build.log ] && tail -300 emz5-build.log > out/emz5-build-tail.txt || true
+          {
+            echo "mode=$MODE"
+            echo "route=$(cat out/route-name.txt 2>/dev/null || echo unknown)"
+            echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            if [ -f jsshell/js-path.txt ]; then
+              JB="$(head -1 jsshell/js-path.txt)"
+              echo "prebuilt_bin=$JB"
+              (ls -l "$JB" 2>/dev/null || true)
+              (sha256sum "$JB" 2>/dev/null || true)
+            fi
+            if [ -f jsshell-source/js-path.txt ]; then
+              JB="$(head -1 jsshell-source/js-path.txt)"
+              echo "built_bin=$JB"
+              (ls -l "$JB" 2>/dev/null || true)
+              (sha256sum "$JB" 2>/dev/null || true)
+            fi
+          } > out/route.txt
+          {
+            echo "{"
+            echo "  \"run_id\": \"$GITHUB_RUN_ID\","
+            echo "  \"run_url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\","
+            echo "  \"commit\": \"$GITHUB_SHA\","
+            echo "  \"mode\": \"$MODE\","
+            echo "  \"route\": \"$(cat out/route-name.txt 2>/dev/null || echo unknown)\","
+            echo "  \"source_url\": \"$SOURCE_URL\","
+            echo "  \"date_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            echo "}"
+          } > out/meta.json
+          ls -l out/
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emz5-jsshell-evidence
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload built shell (source route only)
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emz5-jsshell-shell
+          path: jsshell-source/js
+          retention-days: 7
+
+      - name: Verdict
+        if: always()
+        run: |
+          S1="${{ steps.smoke_prebuilt.outcome }}"
+          S2="${{ steps.smoke_built.outcome }}"
+          echo "smoke_prebuilt=$S1 smoke_built=$S2"
+          if [ "$S1" = "success" ] || [ "$S2" = "success" ]; then
+            echo "VERDICT: jsshell bootstrap OK"
+          else
+            echo "VERDICT: no working jsshell obtained"
+            exit 1
+          fi
