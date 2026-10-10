@@ -217,7 +217,8 @@ jobs:
             echo "}"
           } > out/meta.json
           cp -r kit out/kit
-          ls -l out out/regress out/fuzz 2>/dev/null | head -60 || true
+          cp -r seeds-hex out/seeds-hex 2>/dev/null || true
+          ls -l out out/regress out/fuzz out/seeds-hex 2>/dev/null | head -60 || true
 
       - name: Upload evidence artifact
         if: always()
