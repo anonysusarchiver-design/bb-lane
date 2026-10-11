@@ -7,14 +7,16 @@
 #   crash=yes  <=> "application terminated with exit code" in the log
 #               OR a core dump exists (any process)
 #   frame=yes  <=> a gdb backtrace contains DocAccessibleParent::ProcessHideEvent
-# result file: out/arm1/result.txt ("crashes=N/5")
+# test_discovered=no <=> mochitest filtered the testcase ("is not a valid test" /
+#               "running 0 tests") — a packaging failure, NOT a crash outcome
+# result file: out/arm1/result.txt ("crashes=N/5", "frames=N/5", "test_discovered=...")
 set -uo pipefail
 
 WORK="$(pwd)"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OBJDIR_NAME="obj-a11y1"
 BIN="$WORK/mc/$OBJDIR_NAME/dist/bin/firefox"
-TEST="testing/mochitest/tests/Harness_sanity/a11y1_forge.html"
+TEST="testing/mochitest/tests/Harness_sanity/test_a11y1_forge.html"
 OUT="$WORK/out/arm1"
 mkdir -p "$OUT"
 
@@ -34,6 +36,7 @@ echo "ulimit -c: $(ulimit -c)"
 crashes=0
 frames=0
 runs=5
+discovered="yes"
 for i in $(seq 1 $runs); do
   echo "================ ARM1 RUN $i of $runs ================"
   rm -f /tmp/cores/core.* 2>/dev/null || true
@@ -62,21 +65,29 @@ for i in $(seq 1 $runs); do
   done
   if [ "$ncores" -gt 0 ]; then crash="yes"; fi
 
+  filtered="no"
+  if grep -a -q "is not a valid test" "$LOG" || grep -a -q "running 0 tests" "$LOG"; then
+    filtered="yes"
+    discovered="no"
+    echo "run $i: WARNING: mochitest filtered the testcase (0 tests executed) - packaging problem, NOT a crash outcome"
+  fi
+
   if grep -a -q "TEST-PASS" "$LOG" && grep -a -q "parent process survived" "$LOG"; then
     echo "run $i: test reached the survived-assertion (no crash)"
   fi
 
-  echo "run $i: cores=$ncores crash=$crash frame=$frame"
+  echo "run $i: cores=$ncores crash=$crash frame=$frame filtered=$filtered"
   [ "$crash" = "yes" ] && crashes=$((crashes+1))
   [ "$frame" = "yes" ] && frames=$((frames+1))
   echo "run $i tail:"
   tail -n 15 "$LOG" | sed 's/^/  tail| /'
 done
 
-echo "ARM1 RESULT: crashes=$crashes/$runs frames=$frames/$runs"
+echo "ARM1 RESULT: crashes=$crashes/$runs frames=$frames/$runs test_discovered=$discovered"
 {
   echo "crashes=$crashes/$runs"
   echo "frames=$frames/$runs"
+  echo "test_discovered=$discovered"
 } > "$OUT/result.txt"
 cat "$OUT/result.txt"
 sudo dmesg 2>/dev/null | tail -n 50 > "$OUT/dmesg.txt" || true
