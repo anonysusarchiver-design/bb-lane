@@ -1,0 +1,484 @@
+# bb-lane — a11y3-repro: live repro for A11Y-3 (child doc bound under a
+# move-detached OuterDoc in DocAccessibleParent::AddChildDoc; pinned mirror
+# rev e00a7636053d44c48b523c20b24fde9d3548062a).
+#
+# Self-contained fork of a11y1-repro.yml v2: ALL build/run logic is inlined
+# (no a11y3/*.sh files). Patches must be committed under a11y3/:
+#   a11y3/s3-sender.patch  - test-only forge (LocalAccessible EVENT_HIDE) +
+#                            parent probes (AddChildDoc)
+#   a11y3/s3-test.patch    - test_a11y3_forge.html + mochitest.toml entry
+#   a11y3/s3-fix.patch     - attachment guard probe (ARM2)
+#
+# ARM 1: OPT browser + sender/test patches. 5x mochitest-plain runs.
+#        Expectation: NO crash; transcript shows the forged bind accepted with
+#        zombie=1 (bound-but-unreachable doc subtree) -> ZOMBIE-CONFIRMED.
+# ARM 2: + s3-fix.patch, incremental rebuild, 1 run. Expectation: the guard
+#        rejects the forged bind (explicit "S3PROBE fix rejected detached
+#        embedder" marker + generic IPC_FAIL signature) -> GUARD-HELD.
+#
+# a11y1 lessons applied: (a) custom IPC_FAIL reason strings never reach the
+# log -> the s3 guard emits an explicit NS_WARNING marker; (b) the mochitest
+# harness sets MOZ_CRASHREPORTER_SHUTDOWN, so a guard-rejected run may exit
+# early (rc!=0, final test assertion may not run) - ARM2 therefore judges
+# rejection + no-parent-crash, NOT clean exit; (c) 0 executed tests is
+# PACKAGING-BLOCKED, never evidence.
+#
+# Verdict classes (report-only step): ZOMBIE-CONFIRMED (+ GUARD-HELD) /
+# INCONCLUSIVE / PACKAGING-BLOCKED.
+#
+# Public content only: no secrets, read-only public fetches.
+name: a11y3-repro
+run-name: a11y3-repro ${{ github.event.inputs.name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "run label (a-z0-9-, used in the run title)"
+        required: false
+        default: "a11y3"
+      source_rev:
+        description: "mirror commit to pin"
+        required: false
+        default: "e00a7636053d44c48b523c20b24fde9d3548062a"
+      timeout_min:
+        description: "job timeout minutes (5-355)"
+        required: false
+        default: "355"
+
+concurrency:
+  group: a11y3-repro
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_min || '355') }}
+    env:
+      SRC_REV: ${{ github.event.inputs.source_rev }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Runner probe
+        run: |
+          set -x
+          date -u
+          uname -a
+          nproc
+          free -h | head -2
+          df -h / | tail -1
+          python3 --version
+          echo "SRC_REV=$SRC_REV"
+
+      - name: Build browser (pin + s3 sender/test patches + mach OPT build)
+        id: build
+        timeout-minutes: 265
+        run: |
+          set -euo pipefail
+          exec > >(tee a11y3-build.log) 2>&1
+          echo "== runner =="
+          date -u
+          uname -a
+          nproc
+          free -h | head -2
+          df -h / | tail -1
+          (clang --version | head -2) || echo "clang: absent (bootstrap will fetch)"
+          python3 --version
+
+          echo "== disk pre-clean =="
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo apt-get clean || true
+          df -h / | tail -1
+
+          echo "== apt system deps (per-package, tolerant) =="
+          sudo apt-get update -qq -y
+          PKGS=( m4 autoconf2.13 zlib1g-dev unzip uuid-dev pkg-config libgtk-3-dev libdbus-glib-1-dev libpulse-dev libasound2-dev libxt-dev libx11-xcb-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-sync-dev libxcb-xfixes0-dev libxcomposite-dev libxdamage-dev libxrender-dev libxfixes-dev libxext-dev libxrandr-dev libglib2.0-dev libdrm-dev gdb xvfb fonts-liberation python3-venv python3-dev )
+          for p in "${PKGS[@]}"; do
+            sudo apt-get install -y -qq --no-install-recommends "$p" || echo "NOTE: dep install failed (continuing): $p"
+          done
+          echo "critical probe:"
+          (pkg-config --version && gdb --version | head -1 && command -v xvfb-run && echo deps-ok) || true
+
+          echo "== rust toolchain (stable, must be >= MSRV 1.90) =="
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if ! command -v rustc >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+          rustup component add llvm-tools-preview || true
+          rustup component add rustfmt || true
+
+          echo "== clone pinned source =="
+          rm -rf mc
+          git clone --depth 1 https://github.com/mozilla-firefox/firefox.git mc
+          git -C mc fetch --depth 1 origin "$SRC_REV"
+          git -C mc checkout -q FETCH_HEAD
+          git -C mc rev-parse HEAD | tee a11y3-source-rev.txt
+          git -C mc log -1 --format='%H %s' || true
+
+          echo "== apply test-only patches =="
+          git -C mc apply --verbose a11y3/s3-sender.patch
+          git -C mc apply --verbose a11y3/s3-test.patch
+          echo "-- patch marker checks --"
+          grep -n "S3 FORGE" mc/accessible/generic/LocalAccessible.cpp | head -3
+          grep -n "S3PROBE BEGIN" mc/accessible/ipc/DocAccessibleParent.cpp | head -3
+          grep -n "test_a11y3_forge.html" mc/testing/mochitest/tests/Harness_sanity/mochitest.toml
+          test -f mc/testing/mochitest/tests/Harness_sanity/test_a11y3_forge.html
+
+          echo "== MOZCONFIG =="
+          mkdir -p "$HOME/mozconfigs"
+          cat > "$HOME/mozconfigs/a11y3" <<EOF
+          # generated by a11y3-repro.yml
+          ac_add_options --enable-project=browser
+          ac_add_options --enable-optimize
+          ac_add_options --disable-debug
+          ac_add_options --disable-crashreporter
+          ac_add_options --enable-bootstrap
+          mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-a11y3
+          EOF
+          cat "$HOME/mozconfigs/a11y3"
+          export MOZCONFIG="$HOME/mozconfigs/a11y3"
+          export MOZBUILD_STATE_PATH="$HOME/.mozbuild"
+
+          echo "== build (mach, browser OPT) =="
+          date -u
+          cd mc
+          ./mach build
+          cd ..
+          date -u
+
+          BIN="mc/obj-a11y3/dist/bin/firefox"
+          test -x "$BIN" || { echo "BUILD-ERROR: firefox binary not found"; exit 1; }
+          ls -l "$BIN"
+          sha256sum "$BIN" | tee a11y3-binary-sha256.txt
+          df -h / | tail -1
+          echo "BUILD-OK bin=$(pwd)/$BIN"
+
+      - name: Snapshot patched sources + patches
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p out/patched-src
+          sed -n '880,990p' mc/accessible/generic/LocalAccessible.cpp > out/patched-src/LocalAccessible-EVENT_HIDE.txt
+          sed -n '1070,1160p' mc/accessible/ipc/DocAccessibleParent.cpp > out/patched-src/DocAccessibleParent-AddChildDoc.txt
+          cp mc/testing/mochitest/tests/Harness_sanity/test_a11y3_forge.html out/patched-src/
+          cp mc/testing/mochitest/tests/Harness_sanity/mochitest.toml out/patched-src/
+          cp a11y3/s3-sender.patch a11y3/s3-test.patch a11y3/s3-fix.patch out/
+          sha256sum out/*.patch | tee out/patches-sha256.txt
+          mc/obj-a11y3/dist/bin/firefox --version | tee out/built-version.txt || true
+          sha256sum mc/obj-a11y3/dist/bin/firefox | tee out/built-binary-sha256.txt
+          du -sh mc/obj-a11y3/dist/bin 2>/dev/null || true
+
+      - name: Capture build ID (platform.ini / application.ini)
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p out
+          found=""
+          for f in mc/obj-*/dist/bin/platform.ini mc/obj-*/dist/bin/application.ini; do
+            if [ -f "$f" ]; then
+              echo "build-id source: $f" | tee out/buildid.txt
+              grep -a -i -E "^(BuildID|Name|Milestone|Version|SourceRepository|SourceStamp)=" "$f" | tee -a out/buildid.txt || true
+              cp "$f" out/
+              found="yes"
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "build-id: neither platform.ini nor application.ini found under mc/obj-*/dist/bin/" | tee out/buildid.txt
+            ls -la mc/obj-*/dist/bin/ 2>/dev/null | head -40 || true
+          fi
+          cat out/buildid.txt
+
+      - name: ARM 1 — 5x runs (expect NO crash + zombie probe transcript)
+        id: arm1
+        if: steps.build.outcome == 'success'
+        timeout-minutes: 40
+        run: |
+          set -uo pipefail
+          exec > >(tee a11y3-arm1.log) 2>&1
+          WORK="$(pwd)"
+          OBJDIR_NAME="obj-a11y3"
+          BIN="$WORK/mc/$OBJDIR_NAME/dist/bin/firefox"
+          TEST="testing/mochitest/tests/Harness_sanity/test_a11y3_forge.html"
+          OUT="$WORK/out/arm1"
+          mkdir -p "$OUT"
+          export MOZCONFIG="$HOME/mozconfigs/a11y3"
+          export MOZBUILD_STATE_PATH="$HOME/.mozbuild"
+          test -x "$BIN" || { echo "ARM1-ERROR: binary missing: $BIN"; exit 3; }
+
+          echo "== core capture setup =="
+          sudo mkdir -p /tmp/cores
+          sudo chmod 777 /tmp/cores
+          echo '/tmp/cores/core.%p' | sudo tee /proc/sys/kernel/core_pattern >/dev/null
+          ulimit -c unlimited || true
+          echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+          echo "ulimit -c: $(ulimit -c)"
+
+          crashes=0
+          frames=0
+          zombie_runs=0
+          forge_runs=0
+          bind_sent_runs=0
+          runs=5
+          discovered="yes"
+          for i in $(seq 1 $runs); do
+            echo "================ ARM1 RUN $i of $runs ================"
+            rm -f /tmp/cores/core.* 2>/dev/null || true
+            LOG="$OUT/run-$i.log"
+            cd "$WORK/mc"
+            xvfb-run -a -s "-screen 0 1280x1024x24" ./mach mochitest \
+              --setpref accessibility.force_disabled=-1 \
+              --setpref security.sandbox.content.level=0 \
+              "$TEST" > "$LOG" 2>&1
+            rc=$?
+            cd "$WORK"
+            echo "run $i: mochitest rc=$rc"
+
+            grep -a 'S3PROBE' "$LOG" > "$OUT/run-$i-probes.txt" 2>/dev/null || true
+            zthis="no"
+            grep -a 'S3PROBE bind' "$OUT/run-$i-probes.txt" 2>/dev/null | grep -a -q 'zombie=1' && zthis="yes"
+            fthis="no"
+            grep -a -q 'S3PROBE forge outer=' "$OUT/run-$i-probes.txt" 2>/dev/null && fthis="yes"
+            bthis="no"
+            grep -a -q 'S3PROBE forge bind-sent' "$OUT/run-$i-probes.txt" 2>/dev/null && bthis="yes"
+            [ "$zthis" = "yes" ] && zombie_runs=$((zombie_runs+1))
+            [ "$fthis" = "yes" ] && forge_runs=$((forge_runs+1))
+            [ "$bthis" = "yes" ] && bind_sent_runs=$((bind_sent_runs+1))
+
+            crash="no"
+            frame="no"
+            if grep -a -q "application terminated with exit code" "$LOG"; then crash="yes"; fi
+            ncores=0
+            for CORE in $(ls /tmp/cores/core.* 2>/dev/null); do
+              ncores=$((ncores+1))
+              BTF="$OUT/run-$i-bt-$(basename "$CORE").txt"
+              echo "--- core: $CORE ---" > "$BTF"
+              file "$CORE" >> "$BTF" 2>&1 || true
+              gdb -batch -ex "set pagination off" -ex "bt 60" "$BIN" "$CORE" >> "$BTF" 2>&1 || true
+              if grep -q -E "AddChildDoc|RecvBindChildDoc|ProcessHideEvent" "$BTF"; then frame="yes"; crash="yes"; fi
+            done
+            if [ "$ncores" -gt 0 ]; then crash="yes"; fi
+
+            filtered="no"
+            if grep -a -q "is not a valid test" "$LOG" || grep -a -q "running 0 tests" "$LOG"; then
+              filtered="yes"
+              discovered="no"
+              echo "run $i: WARNING: mochitest filtered the testcase (0 tests executed) - packaging problem, NOT an outcome"
+            fi
+
+            if grep -a -q "TEST-PASS" "$LOG" && grep -a -q "parent process survived" "$LOG"; then
+              echo "run $i: test reached the survived-assertion"
+            fi
+
+            echo "run $i: cores=$ncores crash=$crash frame=$frame filtered=$filtered zombie=$zthis forge=$fthis bind_sent=$bthis"
+            [ "$crash" = "yes" ] && crashes=$((crashes+1))
+            [ "$frame" = "yes" ] && frames=$((frames+1))
+            echo "run $i probes:"
+            cat "$OUT/run-$i-probes.txt" | sed 's/^/  probe| /'
+            echo "run $i tail:"
+            tail -n 15 "$LOG" | sed 's/^/  tail| /'
+          done
+
+          echo "ARM1 RESULT: crashes=$crashes/$runs frames=$frames/$runs zombie_runs=$zombie_runs/$runs forge_runs=$forge_runs/$runs bind_sent_runs=$bind_sent_runs/$runs test_discovered=$discovered"
+          {
+            echo "crashes=$crashes/$runs"
+            echo "frames=$frames/$runs"
+            echo "zombie_runs=$zombie_runs/$runs"
+            echo "forge_runs=$forge_runs/$runs"
+            echo "bind_sent_runs=$bind_sent_runs/$runs"
+            echo "test_discovered=$discovered"
+          } > "$OUT/result.txt"
+          cat "$OUT/result.txt"
+          sudo dmesg 2>/dev/null | tail -n 50 > "$OUT/dmesg.txt" || true
+          ls -la "$OUT"
+          exit 0
+
+      - name: ARM 2 — guard probe + incremental rebuild + 1 run
+        id: arm2
+        if: steps.build.outcome == 'success'
+        timeout-minutes: 70
+        run: |
+          set -uo pipefail
+          exec > >(tee a11y3-arm2.log) 2>&1
+          WORK="$(pwd)"
+          OBJDIR_NAME="obj-a11y3"
+          BIN="$WORK/mc/$OBJDIR_NAME/dist/bin/firefox"
+          TEST="testing/mochitest/tests/Harness_sanity/test_a11y3_forge.html"
+          OUT="$WORK/out/arm2"
+          mkdir -p "$OUT"
+          export MOZCONFIG="$HOME/mozconfigs/a11y3"
+          export MOZBUILD_STATE_PATH="$HOME/.mozbuild"
+          test -x "$BIN" || { echo "ARM2-ERROR: binary missing: $BIN"; exit 3; }
+
+          echo "== apply fix probe =="
+          git -C mc apply --verbose a11y3/s3-fix.patch || { echo "ARM2-ERROR: fix patch failed to apply"; exit 4; }
+          grep -n "S3 FIX-PROBE" mc/accessible/ipc/DocAccessibleParent.cpp
+
+          echo "== incremental rebuild =="
+          date -u
+          cd "$WORK/mc"
+          ./mach build > "$OUT/rebuild.log" 2>&1
+          build_rc=$?
+          cd "$WORK"
+          date -u
+          tail -n 60 "$OUT/rebuild.log"
+          if [ "$build_rc" -ne 0 ]; then
+            echo "ARM2 BUILD-FAILED rc=$build_rc (full log: out/arm2/rebuild.log)"
+            exit 4
+          fi
+          ls -l "$BIN"
+          sha256sum "$BIN" | tee "$OUT/binary-sha256.txt"
+
+          echo "== core capture setup =="
+          sudo mkdir -p /tmp/cores
+          sudo chmod 777 /tmp/cores
+          echo '/tmp/cores/core.%p' | sudo tee /proc/sys/kernel/core_pattern >/dev/null
+          ulimit -c unlimited || true
+          rm -f /tmp/cores/core.* 2>/dev/null || true
+
+          echo "================ ARM2 RUN (guarded build) ================"
+          LOG="$OUT/run-1.log"
+          cd "$WORK/mc"
+          xvfb-run -a -s "-screen 0 1280x1024x24" ./mach mochitest \
+            --setpref accessibility.force_disabled=-1 \
+            --setpref security.sandbox.content.level=0 \
+            "$TEST" > "$LOG" 2>&1
+          rc=$?
+          cd "$WORK"
+          echo "arm2 run rc=$rc"
+
+          fix_marker="no"
+          ipc_fail_sig="no"
+          parent_crash="no"
+          discovered="yes"
+
+          grep -a -q "S3PROBE fix rejected detached embedder" "$LOG" && fix_marker="yes"
+          if grep -a -q "Msg_BindChildDoc" "$LOG" && grep -a -q "handler returned false" "$LOG"; then
+            ipc_fail_sig="yes"
+          fi
+          zombie_lines=$(grep -a 'S3PROBE bind' "$LOG" 2>/dev/null | grep -a -c 'zombie=1' || true)
+          if grep -a -q "is not a valid test" "$LOG" || grep -a -q "running 0 tests" "$LOG"; then
+            discovered="no"
+            echo "arm2: WARNING: mochitest filtered the testcase (0 tests executed) - packaging problem"
+          fi
+
+          for CORE in $(ls /tmp/cores/core.* 2>/dev/null); do
+            BTF="$OUT/run-1-bt-$(basename "$CORE").txt"
+            echo "--- core: $CORE ---" > "$BTF"
+            file "$CORE" >> "$BTF" 2>&1 || true
+            gdb -batch -ex "set pagination off" -ex "bt 60" "$BIN" "$CORE" >> "$BTF" 2>&1 || true
+            if grep -q -E "AddChildDoc|RecvBindChildDoc|ProcessHideEvent" "$BTF"; then parent_crash="yes"; fi
+          done
+          cp /tmp/cores/core.* "$OUT/" 2>/dev/null || true
+          grep -a 'S3PROBE' "$LOG" > "$OUT/run-1-probes.txt" 2>/dev/null || true
+
+          if grep -a -q "application terminated with exit code" "$LOG"; then
+            echo "arm2: browser-terminated marker present"
+          fi
+          if grep -a -q "MOZ_CRASHREPORTER_SHUTDOWN" "$LOG"; then
+            echo "arm2: MOZ_CRASHREPORTER_SHUTDOWN harness shutdown present (tolerated; judge rejection + no parent crash only)"
+          fi
+
+          echo "== notable log lines =="
+          grep -a -n -E "S3PROBE|Msg_BindChildDoc|handler returned false|processing error|Application (ran|terminated|shut down)|Main app process|crashed|exited on signal" "$LOG" | head -n 120 || true
+
+          {
+            echo "fix_marker=$fix_marker"
+            echo "ipc_fail_sig=$ipc_fail_sig"
+            echo "zombie_lines=$zombie_lines"
+            echo "parent_crash=$parent_crash"
+            echo "test_discovered=$discovered"
+            echo "mochitest_rc=$rc"
+          } > "$OUT/result.txt"
+          cat "$OUT/result.txt"
+          sudo dmesg 2>/dev/null | tail -n 50 > "$OUT/dmesg.txt" || true
+          echo "ARM2 DONE"
+          exit 0
+
+      - name: Verdict (report-only; never fails the run)
+        if: always()
+        run: |
+          mkdir -p out
+          B="${{ steps.build.outcome }}"
+          A1="${{ steps.arm1.outcome }}"
+          A2="${{ steps.arm2.outcome }}"
+          echo "outcomes: build=$B arm1=$A1 arm2=$A2"
+          V="VERDICT: UNCLASSIFIED"
+          if [ "$B" != "success" ]; then
+            V="VERDICT: PACKAGING-BLOCKED (build stage incomplete) - see a11y3-build artifacts / step log"
+          elif [ ! -s out/arm1/result.txt ]; then
+            V="VERDICT: INCONCLUSIVE (ARM1 produced no result)"
+          else
+            cat out/arm1/result.txt
+            Z=$(sed -n 's|^zombie_runs=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            C=$(sed -n 's|^crashes=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            D=$(sed -n 's|^test_discovered=\(.*\)$|\1|p' out/arm1/result.txt | head -1)
+            if [ "$D" = "no" ]; then
+              V="VERDICT: PACKAGING-BLOCKED - mochitest did not execute the testcase (0 runs is NOT evidence)"
+            elif [ "${Z:-0}" = "0" ]; then
+              V="VERDICT: INCONCLUSIVE - no 'S3PROBE bind ... zombie=1' line in 5 runs; inspect S3PROBE forge lines (ipcdoc=0?) in run probe files"
+            elif [ "${C:-0}" != "0" ]; then
+              V="VERDICT: INCONCLUSIVE - unexpected ARM1 crashes ($C/5; zombie_runs=$Z/5); inspect cores"
+            elif [ ! -s out/arm2/result.txt ]; then
+              V="VERDICT: ZOMBIE-CONFIRMED ($Z/5 runs) + GUARD NO-RESULT - see a11y3 arm2 step log"
+            else
+              cat out/arm2/result.txt
+              FM=$(sed -n 's|^fix_marker=\(.*\)$|\1|p' out/arm2/result.txt | head -1)
+              PC=$(sed -n 's|^parent_crash=\(.*\)$|\1|p' out/arm2/result.txt | head -1)
+              Z2=$(sed -n 's|^zombie_lines=\([0-9]*\)$|\1|p' out/arm2/result.txt | head -1)
+              if [ "$PC" = "yes" ]; then
+                V="VERDICT: ZOMBIE-CONFIRMED ($Z/5) + GUARD FALSIFIED (parent crashed with guard applied)"
+              elif [ "$FM" = "yes" ] && [ "${Z2:-1}" = "0" ]; then
+                V="VERDICT: ZOMBIE-CONFIRMED ($Z/5, 0 crashes) + GUARD-HELD (guard rejected the forged bind; no zombie line; parent survived)"
+              else
+                V="VERDICT: ZOMBIE-CONFIRMED ($Z/5) + GUARD INCONCLUSIVE (fix marker not observed; zombie_lines=$Z2) - inspect arm2 logs"
+              fi
+            fi
+          fi
+          echo "$V" | tee out/verdict.txt
+          echo "(report-only step: run conclusion is governed by the build/ARM steps; verdict ships in the artifact as out/verdict.txt)"
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo "## a11y3-repro verdict"
+              echo ""
+              echo "$V"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+      - name: Assemble evidence
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "{"
+            echo "  \"run_id\": \"$GITHUB_RUN_ID\","
+            echo "  \"run_url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\","
+            echo "  \"commit\": \"$GITHUB_SHA\","
+            echo "  \"name\": \"${{ github.event.inputs.name }}\","
+            echo "  \"source_rev\": \"$SRC_REV\","
+            echo "  \"build_outcome\": \"${{ steps.build.outcome }}\","
+            echo "  \"arm1_outcome\": \"${{ steps.arm1.outcome }}\","
+            echo "  \"arm2_outcome\": \"${{ steps.arm2.outcome }}\","
+            echo "  \"date_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            echo "}"
+          } > out/meta.json
+          cp a11y3-build.log a11y3-arm1.log a11y3-arm2.log out/ 2>/dev/null || true
+          cat out/meta.json
+          find out -maxdepth 3 -type f | sort | head -120 || true
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11y3-repro-evidence
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn

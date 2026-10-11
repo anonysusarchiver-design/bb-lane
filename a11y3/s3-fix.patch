@@ -1,0 +1,21 @@
+diff --git a/accessible/ipc/DocAccessibleParent.cpp b/accessible/ipc/DocAccessibleParent.cpp
+index 2ae68a9..4472ab7 100644
+--- a/accessible/ipc/DocAccessibleParent.cpp
++++ b/accessible/ipc/DocAccessibleParent.cpp
+@@ -1082,6 +1082,16 @@ ipc::IPCResult DocAccessibleParent::AddChildDoc(DocAccessibleParent* aChildDoc,
+     return IPC_FAIL(this, "Binding to parent that isn't a valid OuterDoc!");
+   }
+ 
++  // S3 FIX-PROBE BEGIN (guard under test; mirrors the missing attachment check
++  // that lets a child doc be bound under a move-detached OuterDoc, before
++  // :1090). Placed before the old child doc is unbound so a rejected bind
++  // mutates no state.
++  if (!outerDoc->RemoteParent() && !outerDoc->IsDoc()) {
++    NS_WARNING("S3PROBE fix rejected detached embedder");
++    return IPC_FAIL(this, "binding to detached embedder");
++  }
++  // S3 FIX-PROBE END.
++
+   if (outerDoc->ChildCount() == 1) {
+     MOZ_ASSERT(outerDoc->RemoteChildAt(0)->AsDoc());
+     outerDoc->RemoteChildAt(0)->AsDoc()->Unbind();

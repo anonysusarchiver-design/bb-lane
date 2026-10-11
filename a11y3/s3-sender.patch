@@ -1,0 +1,151 @@
+diff --git a/accessible/generic/LocalAccessible.cpp b/accessible/generic/LocalAccessible.cpp
+index 3997019..3450f3c 100644
+--- a/accessible/generic/LocalAccessible.cpp
++++ b/accessible/generic/LocalAccessible.cpp
+@@ -30,6 +30,7 @@
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/FloatingPoint.h"
+ #include "mozilla/FocusModel.h"
++#include "mozilla/NotNull.h"
+ #include "mozilla/PerfStats.h"
+ #include "mozilla/PresShell.h"
+ #include "mozilla/ProfilerMarkers.h"
+@@ -60,6 +61,7 @@
+ #include "nsAtom.h"
+ #include "nsComputedDOMStyle.h"
+ #include "nsContainerFrame.h"
++#include "nsDebug.h"
+ #include "nsDisplayList.h"
+ #include "nsEventShell.h"
+ #include "nsFocusManager.h"
+@@ -76,6 +78,7 @@
+ #include "nsLayoutUtils.h"
+ #include "nsMenuPopupFrame.h"
+ #include "nsPresContext.h"
++#include "nsPrintfCString.h"
+ #include "nsString.h"
+ #include "nsStyleStructInlines.h"
+ #include "nsTextEquivUtils.h"
+@@ -902,10 +905,62 @@ nsresult LocalAccessible::HandleAccEvent(AccEvent* aEvent) {
+           ipcDoc->ShowEvent(downcast_accEvent(aEvent));
+           break;
+ 
+-        case nsIAccessibleEvent::EVENT_HIDE:
++        case nsIAccessibleEvent::EVENT_HIDE: {
++          // S3 FORGE BEGIN (test-only repro harness; remove before filing
++          // upstream). For the marked iframe element, forge the wire sequence
++          // of a move: AccessiblesWillMove for the marked OuterDoc, then one
++          // mutation batch that hides the marked OuterDoc (its move branch
++          // leaves it detached) and the victim iframe's embedder (unbinding
++          // the victim's child doc), and finally a BindChildDoc of that unbound
++          // child doc under the detached OuterDoc.
++          nsString s3ForgeId;
++          bool s3Forge =
++              HasOwnContent() && mContent->IsElement() &&
++              mContent->AsElement()->GetAttr(nsGkAtoms::id, s3ForgeId) &&
++              s3ForgeId.EqualsLiteral("a11y3-forge");
++          uint64_t s3VictimEmbedderId = 0;
++          RefPtr<DocAccessibleChild> s3VictimIpcDoc;
++          if (s3Forge) {
++            nsTArray<uint64_t> s3WillMoveIds;
++            s3WillMoveIds.AppendElement(id);
++            ipcDoc->SendAccessiblesWillMove(s3WillMoveIds);
++            if (dom::Element* s3VictimEl =
++                    mDoc->DocumentNode()->GetElementById(u"a11y3-victim"_ns)) {
++              if (LocalAccessible* s3VictimAcc =
++                      mDoc->GetAccessible(s3VictimEl)) {
++                s3VictimEmbedderId = s3VictimAcc->ID();
++                for (uint32_t i = 0; i < s3VictimAcc->ChildCount(); i++) {
++                  LocalAccessible* s3VictimChild = s3VictimAcc->LocalChildAt(i);
++                  if (s3VictimChild && s3VictimChild->IsDoc()) {
++                    s3VictimIpcDoc = s3VictimChild->AsDoc()->IPCDoc();
++                    break;
++                  }
++                }
++              }
++            }
++            NS_WARNING(nsPrintfCString(
++                           "S3PROBE forge outer=%llu victim=%llu ipcdoc=%d",
++                           static_cast<unsigned long long>(id),
++                           static_cast<unsigned long long>(s3VictimEmbedderId),
++                           s3VictimIpcDoc ? 1 : 0)
++                           .get());
++          }
+           ipcDoc->PushMutationEventData(
+               HideEventData{id, aEvent->IsFromUserInput()});
++          if (s3Forge) {
++            if (s3VictimEmbedderId) {
++              ipcDoc->PushMutationEventData(
++                  HideEventData{s3VictimEmbedderId, false});
++            }
++            ipcDoc->SendQueuedMutationEvents();
++            if (s3VictimIpcDoc) {
++              ipcDoc->SendBindChildDoc(WrapNotNull(s3VictimIpcDoc.get()), id);
++              NS_WARNING("S3PROBE forge bind-sent");
++            }
++          }
++          // S3 FORGE END.
+           break;
++        }
+ 
+         case nsIAccessibleEvent::EVENT_INNER_REORDER:
+         case nsIAccessibleEvent::EVENT_REORDER:
+diff --git a/accessible/ipc/DocAccessibleParent.cpp b/accessible/ipc/DocAccessibleParent.cpp
+index 2ae68a9..fc4a6c3 100644
+--- a/accessible/ipc/DocAccessibleParent.cpp
++++ b/accessible/ipc/DocAccessibleParent.cpp
+@@ -1091,6 +1091,54 @@ ipc::IPCResult DocAccessibleParent::AddChildDoc(DocAccessibleParent* aChildDoc,
+   outerDoc->SetChildDoc(aChildDoc);
+   mChildDocs.AppendElement(aChildDoc->mActorID);
+ 
++  // S3PROBE BEGIN (test-only parent-side instrumentation; remove before
++  // filing upstream). Emits a grep-able state line for every child document
++  // bind. On the crafted bind (embedder is a detached outer doc), zombie=1
++  // and rootwalk-reaches-child=0 show a bound-but-unreachable document
++  // subtree; normal binds show zombie=0 / rootwalk=1 / rootchain=1.
++  {
++    const uint64_t s3ChildId = aChildDoc->mActorID;
++    bool s3InMap = GetAccessible(aParentID) != nullptr;
++    bool s3Zombie = !outerDoc->RemoteParent();
++    bool s3ChildUnderEmbedder = aChildDoc->RemoteParent() == outerDoc;
++    bool s3RootWalkReachesChild = false;
++    nsTArray<RemoteAccessible*> s3Queue;
++    for (const RefPtr<RemoteAccessible>& s3RootChild : mChildren) {
++      s3Queue.AppendElement(s3RootChild.get());
++    }
++    size_t s3Visited = 0;
++    while (!s3Queue.IsEmpty() && s3Visited++ < 100000) {
++      RemoteAccessible* s3Cur = s3Queue.PopLast();
++      if (s3Cur == outerDoc) {
++        s3RootWalkReachesChild = true;
++        break;
++      }
++      for (const RefPtr<RemoteAccessible>& s3Child : s3Cur->mChildren) {
++        s3Queue.AppendElement(s3Child.get());
++      }
++    }
++    uint32_t s3RootChainLen = 0;
++    bool s3RootChainReachesDoc = false;
++    for (RemoteAccessible* s3Cur = aChildDoc->RemoteParent(); s3Cur;
++         s3Cur = s3Cur->RemoteParent()) {
++      s3RootChainLen++;
++      if (s3Cur == this) {
++        s3RootChainReachesDoc = true;
++        break;
++      }
++    }
++    NS_WARNING(nsPrintfCString(
++                   "S3PROBE bind child=%" PRIu64 " embedder=%" PRIu64
++                   " in-map=%d zombie=%d child-under-embedder=%d"
++                   " rootwalk-reaches-child=%d rootchain-reaches-doc=%d"
++                   " rootchain-len=%u",
++                   s3ChildId, aParentID, s3InMap ? 1 : 0, s3Zombie ? 1 : 0,
++                   s3ChildUnderEmbedder ? 1 : 0, s3RootWalkReachesChild ? 1 : 0,
++                   s3RootChainReachesDoc ? 1 : 0, s3RootChainLen)
++                   .get());
++  }
++  // S3PROBE END.
++
+   if (aCreating && !aChildDoc->IsPrintDoc()) {
+     ProxyCreated(aChildDoc);
+   }

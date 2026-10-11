@@ -1,0 +1,81 @@
+diff --git a/testing/mochitest/tests/Harness_sanity/mochitest.toml b/testing/mochitest/tests/Harness_sanity/mochitest.toml
+index 1d3ff06..37845af 100644
+--- a/testing/mochitest/tests/Harness_sanity/mochitest.toml
++++ b/testing/mochitest/tests/Harness_sanity/mochitest.toml
+@@ -82,3 +82,5 @@ fail-if = [
+ ]
+ 
+ ["test_sanity_waitForCondition.html"]
++
++["test_a11y3_forge.html"]
+diff --git a/testing/mochitest/tests/Harness_sanity/test_a11y3_forge.html b/testing/mochitest/tests/Harness_sanity/test_a11y3_forge.html
+new file mode 100644
+index 0000000..2e906e2
+--- /dev/null
++++ b/testing/mochitest/tests/Harness_sanity/test_a11y3_forge.html
+@@ -0,0 +1,65 @@
++<!DOCTYPE HTML>
++<html>
++<head>
++  <meta charset="utf-8">
++  <title>A11Y-3 forged bind-under-detached-embedder repro</title>
++  <script src="/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css">
++</head>
++<body>
++<script>
++SimpleTest.waitForExplicitFinish();
++SimpleTest.requestFlakyTimeout("deliberate waits for the a11y pipeline to flush");
++
++// A11Y-3 repro (plain mochitest: the forge is emitted by the test-only sender
++// patch in the CONTENT process, which requires a remote/ipcDoc accessible —
++// a plain content test provides exactly that; a chrome test would run in the
++// parent and ipcDoc would be null).
++//
++// This page hosts two same-process iframes:
++//  - #a11y3-forge: making the marked element's OuterDoc vanish (display:none)
++//    fires a single EVENT_HIDE for it in the content process, where the forge
++//    crafts, for this element only:
++//      AccessiblesWillMove([O1]), batch [Hide(O1), Hide(O2)],
++//      BindChildDoc(D2, O1)
++//    with O1 = #a11y3-forge's OuterDoc, O2 = #a11y3-victim's OuterDoc and
++//    D2 = #a11y3-victim's inner document.
++//  - #a11y3-victim: left untouched and visible; only its embedder's hide is
++//    forged, which un-parents D2 (the normal outer-doc shutdown path) so that
++//    the forged BindChildDoc of D2 under the detached O1 is accepted.
++//
++// Expected: no crash; the parent's S3PROBE bind line shows zombie=1,
++// rootwalk-reaches-child=0, rootchain-reaches-doc=0 (a bound-but-unreachable
++// document subtree). With s3-fix.patch applied (guard probe), the forged bind
++// is rejected via IPC_FAIL ("binding to detached embedder"), no zombie=1 line
++// is emitted and the parent still survives.
++
++is(SpecialPowers.getIntPref("accessibility.force_disabled"), -1,
++   "a11y is force-enabled for this test");
++
++// Both frames are srcdoc documents: about:srcdoc frames inherit this page's
++// principal and are allocated to this page's content process
++// (ProcessIsolation::IsolationBehaviorForURI -> WebContent on the inherited
++// principal), which is what the forged same-process BindChildDoc requires.
++const victim = document.createElement("iframe");
++victim.id = "a11y3-victim";
++victim.srcdoc = "<title>v</title><p>a11y3 victim iframe</p>";
++document.body.appendChild(victim);
++
++const forge = document.createElement("iframe");
++forge.id = "a11y3-forge";
++forge.srcdoc = "<title>f</title><p>a11y3 forge iframe</p>";
++document.body.appendChild(forge);
++
++setTimeout(() => {
++  // Fire the forge: hides #a11y3-forge's OuterDoc, which drives the crafted
++  // sender path. The victim iframe itself is never hidden by the page.
++  forge.style.display = "none";
++  setTimeout(() => {
++    ok(true, "parent process survived the forged bind-under-detached-embedder");
++    SimpleTest.finish();
++  }, 4000);
++}, 3000);
++</script>
++</body>
++</html>
