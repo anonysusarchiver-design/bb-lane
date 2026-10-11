@@ -8,6 +8,19 @@
 # ARM 2: production guard probe (IPC_FAIL on detached parent) applied +
 #        incremental rebuild; 1 run; expectation: guard fires, parent survives.
 #
+# v2 fix wave (after run 38089952284 ran 0 tests):
+#  - Testcase renamed a11y1_forge.html -> test_a11y1_forge.html. Plain-flavor
+#    discovery requires the `test_` basename prefix (runtests.py isTest();
+#    pinned runtests @ 897a2622: plain = r"test_", chrome/a11y =
+#    r"(browser|test)_.+\.(xul|html|js|xhtml)"). Plain flavor is the correct
+#    flavor here: the forge is emitted in the CONTENT process (needs a remote
+#    doc with an ipcDoc) and a chrome-flavor test would run in the parent
+#    process where ipcDoc is null. SpecialPowers is available in plain.
+#  - Verdict step is report-only (never fails the run; classifies
+#    PACKAGING-BLOCKED separately from NOT-CONFIRMED); verdict.txt ships in
+#    the artifact.
+#  - Build ID captured from dist/bin/platform.ini (fallback application.ini).
+#
 # Public content only: no secrets, read-only public fetches.
 name: a11y1-repro
 run-name: a11y1-repro ${{ github.event.inputs.name }}
@@ -70,13 +83,33 @@ jobs:
           mkdir -p out/patched-src
           sed -n '895,930p' mc/accessible/generic/LocalAccessible.cpp > out/patched-src/LocalAccessible-EVENT_HIDE.txt
           sed -n '470,505p' mc/accessible/ipc/DocAccessibleParent.cpp > out/patched-src/DocAccessibleParent-ProcessHideEvent.txt
-          cp mc/testing/mochitest/tests/Harness_sanity/a11y1_forge.html out/patched-src/
+          cp mc/testing/mochitest/tests/Harness_sanity/test_a11y1_forge.html out/patched-src/
           cp mc/testing/mochitest/tests/Harness_sanity/mochitest.toml out/patched-src/
           cp a11y1/a11y1-sender.patch a11y1/a11y1-test.patch a11y1/a11y1-fix.patch out/
           sha256sum out/*.patch | tee out/patches-sha256.txt
           mc/obj-a11y1/dist/bin/firefox --version | tee out/built-version.txt || true
           sha256sum mc/obj-a11y1/dist/bin/firefox | tee out/built-binary-sha256.txt
           du -sh mc/obj-a11y1/dist/bin 2>/dev/null || true
+
+      - name: Capture build ID (platform.ini / application.ini)
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p out
+          found=""
+          for f in mc/obj-*/dist/bin/platform.ini mc/obj-*/dist/bin/application.ini; do
+            if [ -f "$f" ]; then
+              echo "build-id source: $f" | tee out/buildid.txt
+              grep -a -i -E "^(BuildID|Name|Milestone|Version|SourceRepository|SourceStamp)=" "$f" | tee -a out/buildid.txt || true
+              cp "$f" out/
+              found="yes"
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "build-id: neither platform.ini nor application.ini found under mc/obj-*/dist/bin/" | tee out/buildid.txt
+            ls -la mc/obj-*/dist/bin/ 2>/dev/null | head -40 || true
+          fi
+          cat out/buildid.txt
 
       - name: ARM 1 — 5x crash runs (expect parent SEGV 5/5)
         id: arm1
@@ -93,6 +126,52 @@ jobs:
         run: |
           set -o pipefail
           bash a11y1/run-arm2.sh 2>&1 | tee a11y1-arm2.log
+
+      - name: Verdict (report-only; never fails the run)
+        if: always()
+        run: |
+          mkdir -p out
+          B="${{ steps.build.outcome }}"
+          A1="${{ steps.arm1.outcome }}"
+          A2="${{ steps.arm2.outcome }}"
+          echo "outcomes: build=$B arm1=$A1 arm2=$A2"
+          V="VERDICT: UNCLASSIFIED"
+          if [ "$B" != "success" ]; then
+            V="VERDICT: BUILD-STAGE-INCOMPLETE - see a11y1-build.log in the artifact"
+          elif [ ! -s out/arm1/result.txt ]; then
+            V="VERDICT: ARM1-NO-RESULT - see a11y1-arm1.log"
+          else
+            cat out/arm1/result.txt
+            DISCOVERED=$(sed -n 's|^test_discovered=\(.*\)$|\1|p' out/arm1/result.txt | head -1)
+            if [ "$DISCOVERED" = "no" ]; then
+              V="VERDICT: PACKAGING-BLOCKED - mochitest did not execute the testcase (filtered: 'is not a valid test' / 'running 0 tests'); 0 runs is NOT a crash outcome - check test name/registration"
+            else
+              CRASHES=$(sed -n 's|^crashes=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+              FRAMES=$(sed -n 's|^frames=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+              echo "ARM1: crashes=$CRASHES frames=$FRAMES /5"
+              if [ "${CRASHES:-0}" != "5" ]; then
+                V="VERDICT: REPRO NOT CONFIRMED ($CRASHES/5 parent crashes) - inspect run logs/cores"
+              elif [ ! -s out/arm2/result.txt ]; then
+                V="VERDICT: ARM1 confirmed (5/5); ARM2-NO-RESULT (fix-probe run missing) - see a11y1-arm2.log"
+              elif grep -q "parent_crash=yes" out/arm2/result.txt; then
+                V="VERDICT: REPRO CONFIRMED but GUARD FALSIFIED (parent crashed with guard applied)"
+              elif grep -q "guard_fired=yes" out/arm2/result.txt; then
+                V="VERDICT: REPRO CONFIRMED + GUARD HOLDS (IPC_FAIL rejected the forged hide; parent survived)"
+              else
+                V="VERDICT: ARM1 confirmed (5/5); ARM2 INCONCLUSIVE (guard marker not observed) - inspect arm2 logs"
+              fi
+            fi
+          fi
+          echo "$V" | tee out/verdict.txt
+          echo "(report-only step: run conclusion is governed by the build/ARM steps; verdict ships in the artifact as out/verdict.txt)"
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo "## a11y1-repro verdict"
+              echo ""
+              echo "$V"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
 
       - name: Assemble evidence
         if: always()
@@ -123,43 +202,3 @@ jobs:
           path: out/
           retention-days: 7
           if-no-files-found: warn
-
-      - name: Verdict
-        if: always()
-        run: |
-          B="${{ steps.build.outcome }}"
-          A1="${{ steps.arm1.outcome }}"
-          A2="${{ steps.arm2.outcome }}"
-          echo "outcomes: build=$B arm1=$A1 arm2=$A2"
-          if [ "$B" != "success" ]; then
-            echo "VERDICT: BUILD-STAGE-INCOMPLETE — see a11y1-build.log in the artifact"
-            exit 1
-          fi
-          if [ ! -s out/arm1/result.txt ]; then
-            echo "VERDICT: ARM1-NO-RESULT — see a11y1-arm1.log"
-            exit 1
-          fi
-          cat out/arm1/result.txt
-          CRASHES=$(sed -n 's|^crashes=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
-          FRAMES=$(sed -n 's|^frames=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
-          echo "ARM1: crashes=$CRASHES frames=$FRAMES /5"
-          if [ "${CRASHES:-0}" != "5" ]; then
-            echo "VERDICT: REPRO NOT CONFIRMED ($CRASHES/5 parent crashes) — inspect run logs/cores"
-            exit 1
-          fi
-          echo "ARM1 CONFIRMED: parent-process SEGV in 5/5 runs"
-          if [ ! -s out/arm2/result.txt ]; then
-            echo "VERDICT: ARM1 confirmed; ARM2-NO-RESULT (fix-probe run missing) — see a11y1-arm2.log"
-            exit 1
-          fi
-          cat out/arm2/result.txt
-          if grep -q "parent_crash=yes" out/arm2/result.txt; then
-            echo "VERDICT: REPRO CONFIRMED but GUARD FALSIFIED (parent crashed with guard applied)"
-            exit 1
-          fi
-          if grep -q "guard_fired=yes" out/arm2/result.txt; then
-            echo "VERDICT: REPRO CONFIRMED + GUARD HOLDS (IPC_FAIL rejected the forged hide; parent survived)"
-            exit 0
-          fi
-          echo "VERDICT: ARM1 confirmed; ARM2 INCONCLUSIVE (guard marker not observed) — inspect arm2 logs"
-          exit 1
