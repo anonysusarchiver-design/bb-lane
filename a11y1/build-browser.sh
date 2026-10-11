@@ -72,8 +72,8 @@ git -C mc apply --verbose "$HERE/a11y1-sender.patch"
 git -C mc apply --verbose "$HERE/a11y1-test.patch"
 echo "-- patch marker checks --"
 grep -n "A11Y-1 FORGE" mc/accessible/generic/LocalAccessible.cpp | head -3
-grep -n "a11y1_forge.html" mc/testing/mochitest/tests/Harness_sanity/mochitest.toml
-test -f mc/testing/mochitest/tests/Harness_sanity/a11y1_forge.html
+grep -n "test_a11y1_forge.html" mc/testing/mochitest/tests/Harness_sanity/mochitest.toml
+test -f mc/testing/mochitest/tests/Harness_sanity/test_a11y1_forge.html
 cp "$HERE/a11y1-sender.patch" "$HERE/a11y1-test.patch" "$HERE/a11y1-fix.patch" "$WORK/" 2>/dev/null || true
 
 echo "== MOZCONFIG =="
