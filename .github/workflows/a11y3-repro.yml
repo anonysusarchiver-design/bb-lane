@@ -125,8 +125,9 @@ jobs:
           git -C mc log -1 --format='%H %s' || true
 
           echo "== apply test-only patches =="
-          git -C mc apply --verbose a11y3/s3-sender.patch
-          git -C mc apply --verbose a11y3/s3-test.patch
+          # NOTE: -C mc changes cwd for git, so patch paths MUST be absolute (v1.1 fix; run 38181048404 failed here).
+          git -C mc apply --verbose "$GITHUB_WORKSPACE/a11y3/s3-sender.patch"
+          git -C mc apply --verbose "$GITHUB_WORKSPACE/a11y3/s3-test.patch"
           echo "-- patch marker checks --"
           grep -n "S3 FORGE" mc/accessible/generic/LocalAccessible.cpp | head -3
           grep -n "S3PROBE BEGIN" mc/accessible/ipc/DocAccessibleParent.cpp | head -3
@@ -318,7 +319,7 @@ jobs:
           test -x "$BIN" || { echo "ARM2-ERROR: binary missing: $BIN"; exit 3; }
 
           echo "== apply fix probe =="
-          git -C mc apply --verbose a11y3/s3-fix.patch || { echo "ARM2-ERROR: fix patch failed to apply"; exit 4; }
+          git -C mc apply --verbose "$GITHUB_WORKSPACE/a11y3/s3-fix.patch" || { echo "ARM2-ERROR: fix patch failed to apply"; exit 4; }
           grep -n "S3 FIX-PROBE" mc/accessible/ipc/DocAccessibleParent.cpp
 
           echo "== incremental rebuild =="
