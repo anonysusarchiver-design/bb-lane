@@ -1,9 +1,9 @@
-diff --git a/testing/mochitest/tests/Harness_sanity/a11y1_forge.html b/testing/mochitest/tests/Harness_sanity/a11y1_forge.html
+diff --git a/testing/mochitest/tests/Harness_sanity/test_a11y1_forge.html b/testing/mochitest/tests/Harness_sanity/test_a11y1_forge.html
 new file mode 100644
-index 00000000..1a163910
+index 00000000..b4741de5
 --- /dev/null
-+++ b/testing/mochitest/tests/Harness_sanity/a11y1_forge.html
-@@ -0,0 +1,37 @@
++++ b/testing/mochitest/tests/Harness_sanity/test_a11y1_forge.html
+@@ -0,0 +1,39 @@
 +<!DOCTYPE HTML>
 +<html>
 +<head>
@@ -17,12 +17,14 @@ index 00000000..1a163910
 +SimpleTest.waitForExplicitFinish();
 +SimpleTest.requestFlakyTimeout("deliberate waits for the a11y pipeline to flush");
 +
-+// A11Y-1 repro. The test-only sender patch (a11y1-sender.patch) forges, for
-+// this element only: AccessiblesWillMove([id]) followed by a Hide + Hide pair
-+// in one mutation batch. With an unpatched build, the parent process SEGVs on
-+// the second hide in DocAccessibleParent::ProcessHideEvent. With the guard
-+// probe (a11y1-fix.patch), the parent rejects the hide via IPC_FAIL and
-+// survives.
++// A11Y-1 repro (plain mochitest: the forge is emitted by the test-only sender
++// patch in the CONTENT process, which requires a remote/ipcDoc accessible —
++// a plain content test provides exactly that; a chrome test would run in the
++// parent and ipcDoc would be null). The sender forges, for this element only:
++// AccessiblesWillMove([id]) followed by a Hide + Hide pair in one mutation
++// batch. With an unguarded build, the parent process SEGVs on the second hide
++// in DocAccessibleParent::ProcessHideEvent. With the guard probe
++// (a11y1-fix.patch), the parent rejects the hide via IPC_FAIL and survives.
 +is(SpecialPowers.getIntPref("accessibility.force_disabled"), -1,
 +   "a11y is force-enabled for this test");
 +
@@ -50,4 +52,4 @@ index 1d3ff064..1a661fa5 100644
  
  ["test_sanity_waitForCondition.html"]
 +
-+["a11y1_forge.html"]
++["test_a11y1_forge.html"]
