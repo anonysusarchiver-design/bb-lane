@@ -193,7 +193,7 @@ jobs:
 
       - name: Fuzz loop (bounded, one jsshell process per batch)
         id: fuzz
-        timeout-minutes: 35
+        timeout-minutes: 70
         continue-on-error: true
         run: |
           JS=$(head -1 jsshell-asan/js-path.txt)
