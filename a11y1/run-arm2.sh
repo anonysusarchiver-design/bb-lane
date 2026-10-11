@@ -8,6 +8,7 @@
 #   guard marker : "hide for detached accessible"  (IPC_FAIL reason)
 #   parent crash : core backtrace contains DocAccessibleParent::ProcessHideEvent
 #   clean exit   : "Main app process exited normally"
+#   test_discovered=no <=> mochitest filtered the testcase (packaging failure)
 # result file: out/arm2/result.txt
 set -uo pipefail
 
@@ -15,7 +16,7 @@ WORK="$(pwd)"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OBJDIR_NAME="obj-a11y1"
 BIN="$WORK/mc/$OBJDIR_NAME/dist/bin/firefox"
-TEST="testing/mochitest/tests/Harness_sanity/a11y1_forge.html"
+TEST="testing/mochitest/tests/Harness_sanity/test_a11y1_forge.html"
 OUT="$WORK/out/arm2"
 mkdir -p "$OUT"
 
@@ -66,10 +67,15 @@ guard="no"
 parent_crash="no"
 clean_exit="no"
 test_pass="no"
+discovered="yes"
 
 grep -a -q "hide for detached accessible" "$LOG" && guard="yes"
 grep -a -q "Main app process exited normally" "$LOG" && clean_exit="yes"
 grep -a -q "parent process survived" "$LOG" && test_pass="yes"
+if grep -a -q "is not a valid test" "$LOG" || grep -a -q "running 0 tests" "$LOG"; then
+  discovered="no"
+  echo "arm2: WARNING: mochitest filtered the testcase (0 tests executed) - packaging problem"
+fi
 
 for CORE in $(ls /tmp/cores/core.* 2>/dev/null); do
   BTF="$OUT/run-1-bt-$(basename "$CORE").txt"
@@ -92,6 +98,7 @@ grep -a -n -E "hide for detached|ProcessHideEvent|IPC|processing error|Applicati
   echo "parent_crash=$parent_crash"
   echo "clean_exit=$clean_exit"
   echo "test_pass=$test_pass"
+  echo "test_discovered=$discovered"
   echo "mochitest_rc=$rc"
 } > "$OUT/result.txt"
 cat "$OUT/result.txt"
