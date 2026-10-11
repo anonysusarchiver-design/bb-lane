@@ -115,7 +115,7 @@ index 2ae68a9..fc4a6c3 100644
 +    }
 +    size_t s3Visited = 0;
 +    while (!s3Queue.IsEmpty() && s3Visited++ < 100000) {
-+      RemoteAccessible* s3Cur = s3Queue.PopLast();
++      RemoteAccessible* s3Cur = s3Queue[s3Queue.Length() - 1]; s3Queue.RemoveLastElement();
 +      if (s3Cur == outerDoc) {
 +        s3RootWalkReachesChild = true;
 +        break;
