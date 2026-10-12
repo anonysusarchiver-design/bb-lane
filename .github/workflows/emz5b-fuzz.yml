@@ -10,6 +10,9 @@
 #   5. bounded deterministic mutation fuzz over the seeds: one jsshell process per
 #      batch, --fuzzing-safe --no-threads, seeded PRNG; any crash is captured with
 #      the ASAN report + the exact mutating input (emit + single-mutant repro)
+#   6. differential mode (source_url2 set, design fz4-104): the SAME deterministic
+#      mutant stream runs on BOTH shells (A=tip, B=esr), batches interleaved; per-
+#      mutant outcomes are compared (st/vsd/calls/d, rc, ASAN) into diff-summary.json
 #
 # Public content only: no secrets, no repo-sourced data, read-only public fetches.
 name: emz5b-fuzz
@@ -27,6 +30,10 @@ on:
         required: true
       source_url:
         description: "explicit ASAN jsshell zip URL (empty = resolve taskcluster index at runtime)"
+        required: false
+        default: ""
+      source_url2:
+        description: "second ASAN jsshell zip URL (diff B-shell, e.g. ESR; empty = single-shell)"
         required: false
         default: ""
       fuzz_secs:
@@ -67,6 +74,8 @@ jobs:
       BATCH_SIZE: ${{ github.event.inputs.batch_size || '250' }}
       MAX_OPS: ${{ github.event.inputs.max_ops || '6' }}
       BASE_SEED: ${{ github.event.inputs.base_seed || '424242' }}
+      MODE: ${{ github.event.inputs.source_url2 != '' && 'diff' || 'single' }}
+      SOURCE_URL2: ${{ github.event.inputs.source_url2 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,7 +113,7 @@ jobs:
               n += 1; total += len(raw)
           print("kit files:", n, "bytes:", total)
           PY
-          chmod +x kit/run-fuzz.sh 2>/dev/null || true
+          chmod +x kit/*.sh 2>/dev/null || true
           find kit -type f | sort
 
       - name: Fetch ASAN fuzzing jsshell
@@ -137,6 +146,32 @@ jobs:
             echo "asan-runtime=detected" | tee out/asan-runtime.txt
           else
             echo "asan-runtime=NOT-detected" | tee out/asan-runtime.txt
+          fi
+          set -e
+
+      - name: Fetch + verify second ASAN shell (differential)
+        id: fetch2
+        if: ${{ github.event.inputs.source_url2 != '' }}
+        run: |
+          set -o pipefail
+          echo "asan2-url=$SOURCE_URL2" | tee out/asan2-url.txt
+          bash emz5/fetch-jsshell.sh jsshell-asan2 "$SOURCE_URL2" 2>&1 | tee out/fetch2.log
+          JS2=$(head -1 jsshell-asan2/js-path.txt)
+          case "$JS2" in /*) ;; *) JS2="$PWD/$JS2" ;; esac
+          set -x
+          echo "$JS2" | tee out/js2-path.txt
+          "$JS2" --version | tee out/js2-version.txt
+          stat -c '%s bytes' "$JS2" | tee out/js2-size.txt
+          sha256sum jsshell-asan2/jsshell.zip "$JS2" | tee out/sha256-2.txt
+          set +e
+          strings -a "$JS2" | grep -m1 "__asan_report" > out/asan2-strings.txt 2>&1
+          echo "asan2-strings-rc=$?" >> out/asan2-strings.txt
+          ASAN_OPTIONS=help=1:detect_leaks=0 "$JS2" --version > out/asan2-help.log 2>&1
+          echo "asan2-help-rc=$?" >> out/asan2-help.log
+          if grep -m1 -qi "AddressSanitizer" out/asan2-help.log; then
+            echo "asan2-runtime=detected" | tee out/asan2-runtime.txt
+          else
+            echo "asan2-runtime=NOT-detected" | tee out/asan2-runtime.txt
           fi
           set -e
 
@@ -198,7 +233,14 @@ jobs:
         continue-on-error: true
         run: |
           JS=$(head -1 jsshell-asan/js-path.txt)
-          bash kit/run-fuzz.sh "$JS" kit/fuzz-driver.js seeds-hex out/fuzz "$FUZZ_SECS" "$BATCH_SIZE" "$MAX_OPS" "$BASE_SEED" 2>&1 | tee out/fuzz-console.txt
+          if [ -n "$SOURCE_URL2" ]; then
+            JS2=$(head -1 jsshell-asan2/js-path.txt)
+            echo "mode=diff A=tip B=esr" | tee out/fuzz-mode.txt
+            bash kit/diff-fuzz.sh "$JS" "$JS2" kit/fuzz-driver.js seeds-hex out/fuzz "$FUZZ_SECS" "$BATCH_SIZE" "$MAX_OPS" "$BASE_SEED" 2>&1 | tee out/fuzz-console.txt
+          else
+            echo "mode=single" | tee out/fuzz-mode.txt
+            bash kit/run-fuzz.sh "$JS" kit/fuzz-driver.js seeds-hex out/fuzz "$FUZZ_SECS" "$BATCH_SIZE" "$MAX_OPS" "$BASE_SEED" 2>&1 | tee out/fuzz-console.txt
+          fi
 
       - name: Assemble evidence
         if: always()
@@ -214,6 +256,8 @@ jobs:
             echo "  \"batch_size\": \"$BATCH_SIZE\","
             echo "  \"max_ops\": \"$MAX_OPS\","
             echo "  \"base_seed\": \"$BASE_SEED\","
+            echo "  \"mode\": \"$MODE\","
+            echo "  \"source_url2\": \"$SOURCE_URL2\","
             echo "  \"date_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
             echo "}"
           } > out/meta.json
@@ -247,13 +291,33 @@ jobs:
           python3 - <<'PY'
           import json, os
           fuzz_dir = "out/fuzz"
+          dpath = os.path.join(fuzz_dir, "diff-summary.json")
+          reg = open("out/regress/summary.txt").read() if os.path.exists("out/regress/summary.txt") else "(missing)"
+          print(reg.strip())
+          if os.path.exists(dpath):
+              d = json.load(open(dpath))
+              vc = (d.get("divergences") or {})
+              print("diff summary:", json.dumps({
+                  "pairs": d.get("pairs"),
+                  "mutants_tip": (d.get("shell_a_tip") or {}).get("mutants_done"),
+                  "mutants_esr": (d.get("shell_b_esr") or {}).get("mutants_done"),
+                  "divergences": vc,
+              }))
+              substantive = {k: v for k, v in (d.get("verdict_classes") or {}).items() if v}
+              if (d.get("pairs") or 0) > 0:
+                  if substantive:
+                      print("VERDICT: DIFFERENTIAL COMPLETE - DIVERGENCE(S) FOUND: %s (artifact: diff-records.jsonl / diff-lines.txt / samples)" % json.dumps(substantive))
+                  else:
+                      print("VERDICT: DIFFERENTIAL COMPLETE - %d pairs, 0 substantive divergences (info: %s)" % (d.get("pairs"), json.dumps(vc)))
+              else:
+                  print("VERDICT: DIFFERENTIAL DID NOT RUN - inspect artifact")
+                  raise SystemExit(1)
+              raise SystemExit(0)
           summary = {}
           try:
               summary = json.load(open(os.path.join(fuzz_dir, "summary.json")))
           except Exception as e:
               print("fuzz summary unreadable:", e)
-          reg = open("out/regress/summary.txt").read() if os.path.exists("out/regress/summary.txt") else "(missing)"
-          print(reg.strip())
           print("fuzz summary:", json.dumps(summary))
           if summary.get("asan_found"):
               print("VERDICT: ASAN CRASH FOUND IN FUZZ — evidence captured (input + report in artifact); pipeline VALID")
