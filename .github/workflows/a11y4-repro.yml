@@ -1,0 +1,585 @@
+# bb-lane — a11y4-repro: live repro for succ-001-S1 (RemoteAccessible::
+# RelationByType(DETAILS) unchecked GetAccessible -> null deref in the parent
+# process; pinned mirror rev e00a7636053d44c48b523c20b24fde9d3548062a).
+#
+# Self-contained fork of a11y3-repro.yml v1.4 (proven pattern: OPT build ->
+# ARM1 5x runs -> ARM2 incremental rebuild with fix + 1 run -> verdict).
+# Patches must be committed under a11y4/:
+#   a11y4/s1-sender.patch - test-only forge (LocalAccessible EVENT_HIDE for
+#                           #s1-trigger sends an Update cache for #s1-poison
+#                           carrying a forged `target` DETAILS array naming a
+#                           never-mapped id) + parent probes (RemoteAccessible
+#                           ApplyCache + GetDirectRelationFromCache details)
+#                           + P0 fallback self-query (pref-gated, OFF by
+#                           default; engaged from run 3 only if runs 1-2 show
+#                           poison but no crash).
+#   a11y4/s1-test.patch   - browser_a11y4_s1.js in accessible/tests/browser/
+#                           relations/ + browser.toml entry (the xpc consumer
+#                           query that crashes ARM1).
+#   a11y4/s1-fix.patch    - null-target guard in
+#                           nsAccUtils::IsValidDetailsTargetForAnchor (ARM2).
+#
+# ARM 1: OPT browser + sender/test patches. 5x browser-chrome mochitest runs.
+#        Expectation: parent-process SIGSEGV at the consumer query
+#        (bt: Accessible::IsAncestorOf <- nsAccUtils::IsValidDetailsTargetForAnchor
+#        <- RemoteAccessible::RelationByType <- xpcAccessible::GetRelationByType)
+#        with 'S1PROBE details ... resolved=0' in the transcript -> NULLDEREF-CONFIRMED.
+# ARM 2: + s1-fix.patch, incremental rebuild, 1 run. Expectation: guard
+#        rejects the null target ("S1PROBE fix rejected null target"), the
+#        relation is empty (targetsCount=0), no parent crash, test survives
+#        -> GUARD-HELD.
+#
+# a11y3/a11y1 lessons applied: printf_stderr probes only (NS_WARNING compiled
+# out in OPT); ARM steps `set +e` + `|| rc=$?` guards (the runner wraps step
+# scripts in `bash -e`; a bare non-zero per-run rc aborts the loop after run 1);
+# patches applied with absolute $GITHUB_WORKSPACE paths under `git -C mc`;
+# 0 executed tests = PACKAGING-BLOCKED, never evidence; shutdown hangs are
+# expected in this rig (timeout rc=124 + missing SUITE_END) and are reported,
+# not fatal; judge by probes + crash cores + TEST-PASS markers.
+#
+# Verdict classes: NULLDEREF-CONFIRMED / FALSIFIED-QUERY-SURVIVED /
+# INCONCLUSIVE / PACKAGING-BLOCKED (+ GUARD-HELD / GUARD FALSIFIED /
+# GUARD INCONCLUSIVE / GUARD NO-RESULT).
+#
+# Public content only: no secrets, read-only public fetches.
+name: a11y4-repro
+run-name: a11y4-repro ${{ github.event.inputs.name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "run label (a-z0-9-, used in the run title)"
+        required: false
+        default: "a11y4"
+      source_rev:
+        description: "mirror commit to pin"
+        required: false
+        default: "e00a7636053d44c48b523c20b24fde9d3548062a"
+      timeout_min:
+        description: "job timeout minutes (5-355)"
+        required: false
+        default: "355"
+
+concurrency:
+  group: a11y4-repro
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout_min || '355') }}
+    env:
+      SRC_REV: ${{ github.event.inputs.source_rev }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Runner probe
+        run: |
+          set -x
+          date -u
+          uname -a
+          nproc
+          free -h | head -2
+          df -h / | tail -1
+          python3 --version
+          echo "SRC_REV=$SRC_REV"
+
+      - name: Build browser (pin + s1 sender/test patches + mach OPT build)
+        id: build
+        timeout-minutes: 265
+        run: |
+          set -euo pipefail
+          exec > >(tee a11y4-build.log) 2>&1
+          echo "== runner =="
+          date -u
+          uname -a
+          nproc
+          free -h | head -2
+          df -h / | tail -1
+          (clang --version | head -2) || echo "clang: absent (bootstrap will fetch)"
+          python3 --version
+
+          echo "== disk pre-clean =="
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo apt-get clean || true
+          df -h / | tail -1
+
+          echo "== apt system deps (per-package, tolerant) =="
+          sudo apt-get update -qq -y
+          PKGS=( m4 autoconf2.13 zlib1g-dev unzip uuid-dev pkg-config libgtk-3-dev libdbus-glib-1-dev libpulse-dev libasound2-dev libxt-dev libx11-xcb-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-sync-dev libxcb-xfixes0-dev libxcomposite-dev libxdamage-dev libxrender-dev libxfixes-dev libxext-dev libxrandr-dev libglib2.0-dev libdrm-dev gdb xvfb fonts-liberation python3-venv python3-dev )
+          for p in "${PKGS[@]}"; do
+            sudo apt-get install -y -qq --no-install-recommends "$p" || echo "NOTE: dep install failed (continuing): $p"
+          done
+          echo "critical probe:"
+          (pkg-config --version && gdb --version | head -1 && command -v xvfb-run && echo deps-ok) || true
+
+          echo "== rust toolchain (stable, must be >= MSRV 1.90) =="
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          if ! command -v rustc >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+          rustup component add llvm-tools-preview || true
+          rustup component add rustfmt || true
+
+          echo "== clone pinned source =="
+          rm -rf mc
+          git clone --depth 1 https://github.com/mozilla-firefox/firefox.git mc
+          git -C mc fetch --depth 1 origin "$SRC_REV"
+          git -C mc checkout -q FETCH_HEAD
+          git -C mc rev-parse HEAD | tee a11y4-source-rev.txt
+          git -C mc log -1 --format='%H %s' || true
+
+          echo "== apply test-only patches (check first; absolute paths under git -C mc) =="
+          git -C mc apply --check --verbose "$GITHUB_WORKSPACE/a11y4/s1-sender.patch"
+          git -C mc apply --check --verbose "$GITHUB_WORKSPACE/a11y4/s1-test.patch"
+          git -C mc apply --check --verbose "$GITHUB_WORKSPACE/a11y4/s1-fix.patch"   # applied later, in ARM2
+          git -C mc apply --verbose "$GITHUB_WORKSPACE/a11y4/s1-sender.patch"
+          git -C mc apply --verbose "$GITHUB_WORKSPACE/a11y4/s1-test.patch"
+          echo "-- patch marker checks --"
+          grep -n "S1 FORGE" mc/accessible/generic/LocalAccessible.cpp | head -3
+          grep -n "S1PROBE BEGIN" mc/accessible/ipc/RemoteAccessible.cpp | head -3
+          grep -n "a11y4.p0.enabled" mc/accessible/ipc/RemoteAccessible.cpp | head -3
+          grep -n "browser_a11y4_s1.js" mc/accessible/tests/browser/relations/browser.toml
+          test -f mc/accessible/tests/browser/relations/browser_a11y4_s1.js
+
+          echo "== MOZCONFIG =="
+          mkdir -p "$HOME/mozconfigs"
+          cat > "$HOME/mozconfigs/a11y4" <<EOF
+          # generated by a11y4-repro.yml
+          ac_add_options --enable-project=browser
+          ac_add_options --enable-optimize
+          ac_add_options --disable-debug
+          ac_add_options --disable-crashreporter
+          ac_add_options --enable-bootstrap
+          mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-a11y4
+          EOF
+          cat "$HOME/mozconfigs/a11y4"
+          export MOZCONFIG="$HOME/mozconfigs/a11y4"
+          export MOZBUILD_STATE_PATH="$HOME/.mozbuild"
+
+          echo "== build (mach, browser OPT) =="
+          date -u
+          cd mc
+          ./mach build
+          cd ..
+          date -u
+
+          BIN="mc/obj-a11y4/dist/bin/firefox"
+          test -x "$BIN" || { echo "BUILD-ERROR: firefox binary not found"; exit 1; }
+          ls -l "$BIN"
+          sha256sum "$BIN" | tee a11y4-binary-sha256.txt
+          df -h / | tail -1
+          echo "BUILD-OK bin=$(pwd)/$BIN"
+
+      - name: Snapshot patched sources + patches
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p out/patched-src
+          sed -n '900,950p' mc/accessible/generic/LocalAccessible.cpp > out/patched-src/LocalAccessible-EVENT_HIDE.txt
+          sed -n '305,345p' mc/accessible/ipc/RemoteAccessible.cpp > out/patched-src/RemoteAccessible-ApplyCache.txt
+          sed -n '1410,1442p' mc/accessible/ipc/RemoteAccessible.cpp > out/patched-src/RemoteAccessible-RelationByType.txt
+          cp mc/accessible/tests/browser/relations/browser_a11y4_s1.js out/patched-src/
+          cp mc/accessible/tests/browser/relations/browser.toml out/patched-src/browser-relations.toml
+          cp a11y4/s1-sender.patch a11y4/s1-test.patch a11y4/s1-fix.patch out/
+          sha256sum out/*.patch | tee out/patches-sha256.txt
+          mc/obj-a11y4/dist/bin/firefox --version | tee out/built-version.txt || true
+          sha256sum mc/obj-a11y4/dist/bin/firefox | tee out/built-binary-sha256.txt
+          du -sh mc/obj-a11y4/dist/bin 2>/dev/null || true
+
+      - name: Capture build ID (platform.ini / application.ini)
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p out
+          found=""
+          for f in mc/obj-*/dist/bin/platform.ini mc/obj-*/dist/bin/application.ini; do
+            if [ -f "$f" ]; then
+              echo "build-id source: $f" | tee out/buildid.txt
+              grep -a -i -E "^(BuildID|Name|Milestone|Version|SourceRepository|SourceStamp)=" "$f" | tee -a out/buildid.txt || true
+              cp "$f" out/
+              found="yes"
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "build-id: neither platform.ini nor application.ini found under mc/obj-*/dist/bin/" | tee out/buildid.txt
+            ls -la mc/obj-*/dist/bin/ 2>/dev/null | head -40 || true
+          fi
+          cat out/buildid.txt
+
+      - name: ARM 1 — 5x runs (expect parent SIGSEGV at the DETAILS consumer query)
+        id: arm1
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          set +e
+          set -uo pipefail
+          trap '' HUP
+          exec > >(tee a11y4-arm1.log) 2>&1
+          WORK="$(pwd)"
+          OBJDIR_NAME="obj-a11y4"
+          BIN="$WORK/mc/$OBJDIR_NAME/dist/bin/firefox"
+          TEST="accessible/tests/browser/relations/browser_a11y4_s1.js"
+          OUT="$WORK/out/arm1"
+          mkdir -p "$OUT"
+          export MOZCONFIG="$HOME/mozconfigs/a11y4"
+          export MOZBUILD_STATE_PATH="$HOME/.mozbuild"
+          test -x "$BIN" || { echo "ARM1-ERROR: binary missing: $BIN"; exit 3; }
+
+          echo "== core capture setup =="
+          sudo mkdir -p /tmp/cores
+          sudo chmod 777 /tmp/cores
+          echo '/tmp/cores/core.%p' | sudo tee /proc/sys/kernel/core_pattern >/dev/null
+          ulimit -c unlimited || true
+          echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+          echo "ulimit -c: $(ulimit -c)"
+
+          crashes=0
+          frames=0
+          hangs=0
+          forge_runs=0
+          poison_runs=0
+          resolved0_runs=0
+          resolved1_runs=0
+          p0_runs=0
+          survived_runs=0
+          xpc_bt_runs=0
+          p0_bt_runs=0
+          p0_engaged="no"
+          P0_SETPREF=""
+          runs=5
+          discovered="yes"
+          for i in $(seq 1 $runs); do
+            # P0 fallback: runs 1-2 are the plan-faithful xpc consumer path. If
+            # no crash shows after two runs but the poison/resolved0 signal is
+            # present, self-query from the parent for runs 3-5 (documented
+            # deviation; evidence classified accordingly).
+            if [ "$i" -ge 3 ] && [ "$p0_engaged" = "no" ] && [ "$crashes" = "0" ]; then
+              if [ "$poison_runs" -gt 0 ] || [ "$resolved0_runs" -gt 0 ]; then
+                P0_SETPREF="--setpref a11y4.p0.enabled=true"
+                p0_engaged="yes"
+                echo "ARM1: engaging P0 fallback for runs $i-$runs (no crash yet; poison_runs=$poison_runs resolved0_runs=$resolved0_runs)"
+              fi
+            fi
+            echo "================ ARM1 RUN $i of $runs (p0=$p0_engaged) ================"
+            rm -f /tmp/cores/core.* 2>/dev/null || true
+            LOG="$OUT/run-$i.log"
+            cd "$WORK/mc"
+            # v1.4 lesson: the runner wraps this script in `bash -e`; without the
+            # `|| rc=$?` guard a non-zero per-run rc (timeout-kill 124 on the
+            # shutdown hang) aborts the loop after run 1.
+            rc=0
+            setsid timeout -k 10 180 xvfb-run -a -s "-screen 0 1280x1024x24" ./mach mochitest \
+              --setpref accessibility.force_disabled=-1 \
+              --setpref security.sandbox.content.level=0 \
+              $P0_SETPREF \
+              "$TEST" > "$LOG" 2>&1 || rc=$?
+            cd "$WORK"
+            pkill -f "obj-a11y4/dist/bin/firefox" 2>/dev/null || true
+            pkill Xvfb 2>/dev/null || true
+            sleep 1
+            echo "run $i: mochitest rc=$rc"
+
+            grep -a 'S1PROBE' "$LOG" > "$OUT/run-$i-probes.txt" 2>/dev/null || true
+            forge_this="no"
+            grep -a -q 'S1PROBE forge sent' "$OUT/run-$i-probes.txt" 2>/dev/null && forge_this="yes"
+            poison_this="no"
+            grep -a -q 'S1PROBE poison-arrived' "$OUT/run-$i-probes.txt" 2>/dev/null && poison_this="yes"
+            details0_this="no"
+            grep -a 'S1PROBE details' "$OUT/run-$i-probes.txt" 2>/dev/null | grep -a -q 'resolved=0' && details0_this="yes"
+            details1_this="no"
+            grep -a 'S1PROBE details' "$OUT/run-$i-probes.txt" 2>/dev/null | grep -a -q 'resolved=1' && details1_this="yes"
+            p0_this="no"
+            grep -a -q 'S1PROBE p0-trigger' "$OUT/run-$i-probes.txt" 2>/dev/null && p0_this="yes"
+            survived_this="no"
+            grep -a -q 'parent process survived' "$LOG" 2>/dev/null && survived_this="yes"
+            [ "$forge_this" = "yes" ] && forge_runs=$((forge_runs+1))
+            [ "$poison_this" = "yes" ] && poison_runs=$((poison_runs+1))
+            [ "$details0_this" = "yes" ] && resolved0_runs=$((resolved0_runs+1))
+            [ "$details1_this" = "yes" ] && resolved1_runs=$((resolved1_runs+1))
+            [ "$p0_this" = "yes" ] && p0_runs=$((p0_runs+1))
+            [ "$survived_this" = "yes" ] && survived_runs=$((survived_runs+1))
+
+            crash="no"
+            frame="no"
+            bt_xpc="no"
+            bt_p0="no"
+            if grep -a -q "application terminated with exit code" "$LOG"; then crash="yes"; fi
+            if grep -a -q "PROCESS-CRASH" "$LOG"; then crash="yes"; fi
+            ncores=0
+            for CORE in $(ls /tmp/cores/core.* 2>/dev/null); do
+              ncores=$((ncores+1))
+              BTF="$OUT/run-$i-bt-$(basename "$CORE").txt"
+              echo "--- core: $CORE ---" > "$BTF"
+              file "$CORE" >> "$BTF" 2>&1 || true
+              gdb -batch -ex "set pagination off" -ex "bt 60" "$BIN" "$CORE" >> "$BTF" 2>&1 || true
+              if grep -q -E "IsValidDetailsTargetForAnchor|RemoteAccessible::RelationByType|Accessible::IsAncestorOf" "$BTF"; then frame="yes"; crash="yes"; fi
+              if grep -q "xpcAccessible::GetRelationByType" "$BTF"; then bt_xpc="yes"; fi
+              if grep -q -E "RecvCache|ApplyCache" "$BTF"; then bt_p0="yes"; fi
+            done
+            if [ "$ncores" -gt 0 ]; then crash="yes"; fi
+            [ "$frame" = "yes" ] && frames=$((frames+1))
+            [ "$bt_xpc" = "yes" ] && xpc_bt_runs=$((xpc_bt_runs+1))
+            [ "$bt_p0" = "yes" ] && p0_bt_runs=$((p0_bt_runs+1))
+
+            hangthis="no"
+            if { [ "$rc" = "124" ] || ! grep -a -q "SUITE_END" "$LOG"; } && [ "$crash" = "no" ]; then hangthis="yes"; fi
+            [ "$hangthis" = "yes" ] && hangs=$((hangs+1))
+
+            filtered="no"
+            if grep -a -q "is not a valid test" "$LOG" || grep -a -q "running 0 tests" "$LOG"; then
+              filtered="yes"
+              discovered="no"
+              echo "run $i: WARNING: mochitest filtered the testcase (0 tests executed) - packaging problem, NOT an outcome"
+            fi
+            if grep -a -q "TEST_START" "$LOG" && grep -a -q "browser_a11y4_s1" "$LOG"; then
+              echo "run $i: testcase reached TEST_START"
+            else
+              echo "run $i: NOTE: no TEST_START for browser_a11y4_s1 found in transcript"
+            fi
+
+            echo "run $i: cores=$ncores crash=$crash frame=$frame filtered=$filtered forge=$forge_this poison=$poison_this details0=$details0_this details1=$details1_this p0=$p0_this survived=$survived_this bt_xpc=$bt_xpc bt_p0=$bt_p0 hang=$hangthis"
+            echo "run $i probes:"
+            cat "$OUT/run-$i-probes.txt" | sed 's/^/  probe| /'
+            echo "run $i tail:"
+            tail -n 12 "$LOG" | sed 's/^/  tail| /'
+          done
+
+          echo "ARM1 RESULT: crashes=$crashes/$runs frames=$frames/$runs hangs=$hangs/$runs forge_runs=$forge_runs/$runs poison_runs=$poison_runs/$runs resolved0_runs=$resolved0_runs/$runs resolved1_runs=$resolved1_runs/$runs p0_runs=$p0_runs/$runs survived_runs=$survived_runs/$runs xpc_bt_runs=$xpc_bt_runs/$runs p0_bt_runs=$p0_bt_runs/$runs p0_engaged=$p0_engaged test_discovered=$discovered"
+          {
+            echo "crashes=$crashes/$runs"
+            echo "frames=$frames/$runs"
+            echo "hangs=$hangs/$runs"
+            echo "forge_runs=$forge_runs/$runs"
+            echo "poison_runs=$poison_runs/$runs"
+            echo "resolved0_runs=$resolved0_runs/$runs"
+            echo "resolved1_runs=$resolved1_runs/$runs"
+            echo "p0_runs=$p0_runs/$runs"
+            echo "survived_runs=$survived_runs/$runs"
+            echo "xpc_bt_runs=$xpc_bt_runs/$runs"
+            echo "p0_bt_runs=$p0_bt_runs/$runs"
+            echo "p0_engaged=$p0_engaged"
+            echo "test_discovered=$discovered"
+          } > "$OUT/result.txt"
+          cat "$OUT/result.txt"
+          sudo dmesg 2>/dev/null | tail -n 50 > "$OUT/dmesg.txt" || true
+          ls -la "$OUT"
+          exit 0
+
+      - name: ARM 2 — guard probe + incremental rebuild + 1 run
+        id: arm2
+        if: always() && steps.build.outcome == 'success'
+        timeout-minutes: 70
+        run: |
+          set +e
+          set -uo pipefail
+          exec > >(tee a11y4-arm2.log) 2>&1
+          WORK="$(pwd)"
+          OBJDIR_NAME="obj-a11y4"
+          BIN="$WORK/mc/$OBJDIR_NAME/dist/bin/firefox"
+          TEST="accessible/tests/browser/relations/browser_a11y4_s1.js"
+          OUT="$WORK/out/arm2"
+          mkdir -p "$OUT"
+          export MOZCONFIG="$HOME/mozconfigs/a11y4"
+          export MOZBUILD_STATE_PATH="$HOME/.mozbuild"
+          test -x "$BIN" || { echo "ARM2-ERROR: binary missing: $BIN"; exit 3; }
+
+          echo "== apply fix probe =="
+          git -C mc apply --verbose "$GITHUB_WORKSPACE/a11y4/s1-fix.patch" || { echo "ARM2-ERROR: fix patch failed to apply"; exit 4; }
+          grep -n "S1 FIX-PROBE" mc/accessible/base/nsAccUtils.cpp
+
+          echo "== incremental rebuild =="
+          date -u
+          cd "$WORK/mc"
+          ./mach build > "$OUT/rebuild.log" 2>&1
+          build_rc=$?
+          cd "$WORK"
+          date -u
+          tail -n 60 "$OUT/rebuild.log"
+          if [ "$build_rc" -ne 0 ]; then
+            echo "ARM2 BUILD-FAILED rc=$build_rc (full log: out/arm2/rebuild.log)"
+            exit 4
+          fi
+          ls -l "$BIN"
+          sha256sum "$BIN" | tee "$OUT/binary-sha256.txt"
+
+          echo "== core capture setup =="
+          sudo mkdir -p /tmp/cores
+          sudo chmod 777 /tmp/cores
+          echo '/tmp/cores/core.%p' | sudo tee /proc/sys/kernel/core_pattern >/dev/null
+          ulimit -c unlimited || true
+          rm -f /tmp/cores/core.* 2>/dev/null || true
+
+          echo "================ ARM2 RUN (guarded build; no P0 pref) ================"
+          LOG="$OUT/run-1.log"
+          cd "$WORK/mc"
+          rc=0
+          setsid timeout -k 10 180 xvfb-run -a -s "-screen 0 1280x1024x24" ./mach mochitest \
+            --setpref accessibility.force_disabled=-1 \
+            --setpref security.sandbox.content.level=0 \
+            "$TEST" > "$LOG" 2>&1 || rc=$?
+          cd "$WORK"
+          pkill -f "obj-a11y4/dist/bin/firefox" 2>/dev/null || true
+          pkill Xvfb 2>/dev/null || true
+          echo "arm2 run rc=$rc"
+          hang="no"
+          crash_hint="no"
+          if grep -a -q "application terminated with exit code" "$LOG" || grep -a -q "PROCESS-CRASH" "$LOG"; then crash_hint="yes"; fi
+          if { [ "$rc" = "124" ] || ! grep -a -q "SUITE_END" "$LOG"; } && [ "$crash_hint" = "no" ]; then hang="yes"; fi
+          echo "arm2 run hang=$hang crash_hint=$crash_hint"
+
+          fix_marker="no"
+          poison_here="no"
+          details1_lines=$(grep -a -c 'S1PROBE details .*resolved=1' "$LOG" 2>/dev/null || true)
+          resolved0_lines=$(grep -a -c 'S1PROBE details .*resolved=0' "$LOG" 2>/dev/null || true)
+          p0_lines=$(grep -a -c 'S1PROBE p0-trigger' "$LOG" 2>/dev/null || true)
+          survived="no"
+          parent_crash="no"
+          discovered="yes"
+
+          grep -a -q "S1PROBE fix rejected null target" "$LOG" && fix_marker="yes"
+          grep -a -q "S1PROBE poison-arrived" "$LOG" && poison_here="yes"
+          grep -a -q "parent process survived" "$LOG" && survived="yes"
+          if grep -a -q "is not a valid test" "$LOG" || grep -a -q "running 0 tests" "$LOG"; then
+            discovered="no"
+            echo "arm2: WARNING: mochitest filtered the testcase (0 tests executed) - packaging problem"
+          fi
+
+          for CORE in $(ls /tmp/cores/core.* 2>/dev/null); do
+            BTF="$OUT/run-1-bt-$(basename "$CORE").txt"
+            echo "--- core: $CORE ---" > "$BTF"
+            file "$CORE" >> "$BTF" 2>&1 || true
+            gdb -batch -ex "set pagination off" -ex "bt 60" "$BIN" "$CORE" >> "$BTF" 2>&1 || true
+            if grep -q -E "IsValidDetailsTargetForAnchor|RemoteAccessible::RelationByType|Accessible::IsAncestorOf" "$BTF"; then parent_crash="yes"; fi
+          done
+          cp /tmp/cores/core.* "$OUT/" 2>/dev/null || true
+          grep -a 'S1PROBE' "$LOG" > "$OUT/run-1-probes.txt" 2>/dev/null || true
+
+          if grep -a -q "MOZ_CRASHREPORTER_SHUTDOWN" "$LOG"; then
+            echo "arm2: MOZ_CRASHREPORTER_SHUTDOWN harness shutdown present (tolerated; judge marker + no parent crash)"
+          fi
+
+          echo "== notable log lines =="
+          grep -a -n -E "S1PROBE|parent process survived|TEST-START|TEST-END|Application (ran|terminated|shut down)|crashed|exited on signal" "$LOG" | head -n 80 || true
+
+          {
+            echo "fix_marker=$fix_marker"
+            echo "poison_here=$poison_here"
+            echo "resolved0_lines=$resolved0_lines"
+            echo "details1_lines=$details1_lines"
+            echo "p0_lines=$p0_lines"
+            echo "survived=$survived"
+            echo "parent_crash=$parent_crash"
+            echo "test_discovered=$discovered"
+            echo "mochitest_rc=$rc"
+            echo "hang=$hang"
+          } > "$OUT/result.txt"
+          cat "$OUT/result.txt"
+          sudo dmesg 2>/dev/null | tail -n 50 > "$OUT/dmesg.txt" || true
+          echo "ARM2 DONE"
+          exit 0
+
+      - name: Verdict (report-only; never fails the run)
+        if: always()
+        run: |
+          mkdir -p out
+          B="${{ steps.build.outcome }}"
+          A1="${{ steps.arm1.outcome }}"
+          A2="${{ steps.arm2.outcome }}"
+          echo "outcomes: build=$B arm1=$A1 arm2=$A2"
+          V="VERDICT: UNCLASSIFIED"
+          if [ "$B" != "success" ]; then
+            V="VERDICT: PACKAGING-BLOCKED (build stage incomplete) - see a11y4-build artifacts / step log"
+          elif [ ! -s out/arm1/result.txt ]; then
+            V="VERDICT: INCONCLUSIVE (ARM1 produced no result)"
+          else
+            cat out/arm1/result.txt
+            C=$(sed -n 's|^crashes=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            FR=$(sed -n 's|^frames=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            H=$(sed -n 's|^hangs=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            PO=$(sed -n 's|^poison_runs=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            D0=$(sed -n 's|^resolved0_runs=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            XB=$(sed -n 's|^xpc_bt_runs=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            PB=$(sed -n 's|^p0_bt_runs=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            P0E=$(sed -n 's|^p0_engaged=\(.*\)$|\1|p' out/arm1/result.txt | head -1)
+            D=$(sed -n 's|^test_discovered=\(.*\)$|\1|p' out/arm1/result.txt | head -1)
+            A1CLASS="INCONCLUSIVE - inspect arm1 probes (poison=$PO resolved0=$D0 forge runs) and transcripts"
+            if [ "$D" = "no" ]; then
+              A1CLASS="PACKAGING-BLOCKED - mochitest did not execute the testcase (0 runs is NOT evidence)"
+            elif [ "${C:-0}" != "0" ] && [ "${FR:-0}" != "0" ] && [ "${D0:-0}" != "0" ]; then
+              A1CLASS="NULLDEREF-CONFIRMED (${C}/5 crashes, resolved0=${D0}/5, forge=${PO}/5 poison lines, xpc_bt=${XB}/5, p0_bt=${PB}/5, p0_engaged=$P0E, hang_runs=${H:-?}/5)"
+            elif [ "${D0:-0}" != "0" ] && [ "${PO:-0}" != "0" ] && [ "${C:-0}" = "0" ]; then
+              A1CLASS="FALSIFIED-QUERY-SURVIVED (resolved0=${D0}/5, no crash in 5 runs - deref claim false for this build/config; stop and re-analyze)"
+            fi
+            if [ ! -s out/arm2/result.txt ]; then
+              V="VERDICT: ${A1CLASS} + GUARD NO-RESULT - see a11y4 arm2 step log"
+            else
+              cat out/arm2/result.txt
+              FM=$(sed -n 's|^fix_marker=\(.*\)$|\1|p' out/arm2/result.txt | head -1)
+              PH=$(sed -n 's|^poison_here=\(.*\)$|\1|p' out/arm2/result.txt | head -1)
+              R0=$(sed -n 's|^resolved0_lines=\([0-9]*\)$|\1|p' out/arm2/result.txt | head -1)
+              SV=$(sed -n 's|^survived=\(.*\)$|\1|p' out/arm2/result.txt | head -1)
+              PC=$(sed -n 's|^parent_crash=\(.*\)$|\1|p' out/arm2/result.txt | head -1)
+              D2=$(sed -n 's|^test_discovered=\(.*\)$|\1|p' out/arm2/result.txt | head -1)
+              if [ "$D2" = "no" ]; then
+                A2CLASS="GUARD INCONCLUSIVE (ARM2 testcase not executed)"
+              elif [ "$PC" = "yes" ]; then
+                A2CLASS="GUARD FALSIFIED (parent crashed with guard applied)"
+              elif [ "$FM" = "yes" ] && [ "$SV" = "yes" ] && [ "${R0:-0}" != "0" ]; then
+                A2CLASS="GUARD-HELD (fix marker + resolved0=${R0} + guard engaged, no parent crash; test survived)"
+              else
+                A2CLASS="GUARD INCONCLUSIVE (fix_marker=$FM poison_here=$PH resolved0_lines=${R0:-0} survived=$SV; inspect arm2 logs)"
+              fi
+              V="VERDICT: ${A1CLASS} + ${A2CLASS}"
+            fi
+          fi
+          echo "$V" | tee out/verdict.txt
+          echo "(report-only step: run conclusion is governed by the build/ARM steps; verdict ships in the artifact as out/verdict.txt)"
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo "## a11y4-repro verdict"
+              echo ""
+              echo "$V"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+      - name: Assemble evidence
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "{"
+            echo "  \"run_id\": \"$GITHUB_RUN_ID\","
+            echo "  \"run_url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\","
+            echo "  \"commit\": \"$GITHUB_SHA\","
+            echo "  \"name\": \"${{ github.event.inputs.name }}\","
+            echo "  \"source_rev\": \"$SRC_REV\","
+            echo "  \"build_outcome\": \"${{ steps.build.outcome }}\","
+            echo "  \"arm1_outcome\": \"${{ steps.arm1.outcome }}\","
+            echo "  \"arm2_outcome\": \"${{ steps.arm2.outcome }}\","
+            echo "  \"date_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            echo "}"
+          } > out/meta.json
+          cp a11y4-build.log a11y4-arm1.log a11y4-arm2.log out/ 2>/dev/null || true
+          cat out/meta.json
+          find out -maxdepth 3 -type f | sort | head -140 || true
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11y4-repro-evidence
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn

@@ -1,0 +1,85 @@
+diff --git a/accessible/tests/browser/relations/browser.toml b/accessible/tests/browser/relations/browser.toml
+index 10aa3b5..32264b7 100644
+--- a/accessible/tests/browser/relations/browser.toml
++++ b/accessible/tests/browser/relations/browser.toml
+@@ -17,6 +17,8 @@ prefs = [
+   "dom.element.popoverhint.enabled=true",
+ ]
+ 
++["browser_a11y4_s1.js"]
++
+ ["browser_anchor_positioning.js"]
+ 
+ ["browser_multiple_relations_crash.js"]
+diff --git a/accessible/tests/browser/relations/browser_a11y4_s1.js b/accessible/tests/browser/relations/browser_a11y4_s1.js
+new file mode 100644
+index 0000000..2e64efd
+--- /dev/null
++++ b/accessible/tests/browser/relations/browser_a11y4_s1.js
+@@ -0,0 +1,66 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++requestLongerTimeout(2);
++SimpleTest.requestFlakyTimeout("deliberate waits for the a11y pipeline to flush");
++
++// succ-001-S1 repro (test-only forge harness; remove before filing upstream).
++// The content-side patch in LocalAccessible::HandleAccEvent (EVENT_HIDE for
++// #s1-trigger) sends an Update cache for the still-visible #s1-poison element
++// carrying a forged `target` (DETAILS) relation array naming a nonzero,
++// never-mapped id. Querying RELATION_DETAILS on the poisoned remote
++// accessible in the parent evaluates
++//   GetAccessible(absent id) -> nullptr
++//   -> nsAccUtils::IsValidDetailsTargetForAnchor(nullptr)
++//   -> Accessible::IsAncestorOf -> nullptr->Parent() -> parent SIGSEGV.
++// With the ARM2 guard applied, the null target is rejected, the relation is
++// empty and the browser survives.
++
++addAccessibleTask(
++  `
++  <div id="s1-poison">poison</div>
++  <div id="s1-trigger">trigger</div>
++  <script>
++    // The content page fires the forge on its own after 2s so the repro does
++    // not depend on the parent harness driving content. Harmless if the test
++    // already hid #s1-trigger (the second hide fires no event).
++    setTimeout(() => {
++      document.getElementById("s1-trigger").hidden = true;
++    }, 2000);
++  </script>
++  `,
++  async function testS1(browser, accDoc) {
++    let poison = findAccessibleChildByID(accDoc, "s1-poison");
++    ok(poison, "found the s1-poison remote accessible");
++
++    // Warm-up query: activates the relations cache domain; no `target` field
++    // is cached yet, so this cannot crash and returns an empty relation.
++    poison.getRelationByType(Ci.nsIAccessibleRelation.RELATION_DETAILS);
++
++    // Drive the content-side forge (hide #s1-trigger). The inline script
++    // above does the same at 2s if this task never reaches here.
++    await invokeContentTask(browser, [], () => {
++      setTimeout(() => {
++        content.document.getElementById("s1-trigger").hidden = true;
++      }, 1000);
++    });
++
++    await new Promise(resolve => setTimeout(resolve, 2500));
++
++    // Trigger: consumer query on the poisoned remote acc. ARM1 crashes HERE
++    // (bt: Accessible::IsAncestorOf <- IsValidDetailsTargetForAnchor
++    //  <- RemoteAccessible::RelationByType <- xpcAccessible::GetRelationByType).
++    let relation = poison.getRelationByType(
++      Ci.nsIAccessibleRelation.RELATION_DETAILS
++    );
++    ok(relation, "got the DETAILS relation object");
++
++    // ARM2 (guard) path: the forged id is rejected and the relation is empty.
++    is(relation.targetsCount, 0, "forged details target produced no targets");
++
++    ok(true, "parent process survived the forged null details target");
++  }
++);

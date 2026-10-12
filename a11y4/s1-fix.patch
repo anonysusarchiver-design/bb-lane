@@ -1,0 +1,29 @@
+diff --git a/accessible/base/nsAccUtils.cpp b/accessible/base/nsAccUtils.cpp
+index 85eba5c..f3793db 100644
+--- a/accessible/base/nsAccUtils.cpp
++++ b/accessible/base/nsAccUtils.cpp
+@@ -13,6 +13,7 @@
+ #include "TextLeafAccessible.h"
+ #include "mozilla/a11y/RemoteAccessible.h"
+ #include "mozilla/a11y/Role.h"
++#include "mozilla/Printf.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/ElementInternals.h"
+@@ -667,6 +668,16 @@ bool nsAccUtils::ShouldFireValueChangeForDescendantChanges(
+ 
+ bool nsAccUtils::IsValidDetailsTargetForAnchor(const Accessible* aTarget,
+                                                const Accessible* aAnchor) {
++  // S1 FIX-PROBE BEGIN (guard under test; remove before filing upstream).
++  // A remote relation cache can name an id that no longer resolves, so the
++  // unchecked GetAccessible() result at the RemoteAccessible call site can
++  // be null; IsAncestorOf would deref it. A target that is not in the tree
++  // cannot be a valid details target.
++  if (!aTarget) {
++    printf_stderr("S1PROBE fix rejected null target\n");
++    return false;
++  }
++  // S1 FIX-PROBE END.
+   if (aAnchor->IsAncestorOf(aTarget)) {
+     // If the anchor is a parent of the target, the target is not valid
+     // relation.

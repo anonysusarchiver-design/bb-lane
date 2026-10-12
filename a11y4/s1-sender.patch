@@ -1,0 +1,125 @@
+diff --git a/accessible/generic/LocalAccessible.cpp b/accessible/generic/LocalAccessible.cpp
+index 3997019..2e7f475 100644
+--- a/accessible/generic/LocalAccessible.cpp
++++ b/accessible/generic/LocalAccessible.cpp
+@@ -32,6 +32,7 @@
+ #include "mozilla/FocusModel.h"
+ #include "mozilla/PerfStats.h"
+ #include "mozilla/PresShell.h"
++#include "mozilla/Printf.h"
+ #include "mozilla/ProfilerMarkers.h"
+ #include "mozilla/ScrollContainerFrame.h"
+ #include "mozilla/StaticPrefs_accessibility.h"
+@@ -902,10 +903,47 @@ nsresult LocalAccessible::HandleAccEvent(AccEvent* aEvent) {
+           ipcDoc->ShowEvent(downcast_accEvent(aEvent));
+           break;
+ 
+-        case nsIAccessibleEvent::EVENT_HIDE:
++        case nsIAccessibleEvent::EVENT_HIDE: {
++          // S1 FORGE BEGIN (test-only repro harness; remove before filing
++          // upstream). When the marked trigger element is hidden in the
++          // content process, forge an Update cache for the still-visible
++          // #s1-poison element whose `target` (DETAILS) relation array names
++          // a nonzero id that was never mapped in the parent process.
++          // Querying DETAILS on the poisoned remote acc in the parent then
++          // evaluates GetAccessible(absent id) -> nullptr ->
++          // nsAccUtils::IsValidDetailsTargetForAnchor(nullptr) ->
++          // Accessible::IsAncestorOf -> nullptr->Parent() -> SIGSEGV in the
++          // parent process (succ-001-S1).
++          nsString s1TriggerId;
++          bool s1Forge =
++              HasOwnContent() && mContent->IsElement() &&
++              mContent->AsElement()->GetAttr(nsGkAtoms::id, s1TriggerId) &&
++              s1TriggerId.EqualsLiteral("s1-trigger");
++          if (s1Forge) {
++            if (dom::Element* s1PoisonEl =
++                    mDoc->DocumentNode()->GetElementById(u"s1-poison"_ns)) {
++              if (LocalAccessible* s1PoisonAcc =
++                      mDoc->GetAccessible(s1PoisonEl)) {
++                RefPtr<AccAttributes> s1Fields = new AccAttributes();
++                nsTArray<uint64_t> s1BogusIds;
++                s1BogusIds.AppendElement(0xDEADBEEFCAFEULL);
++                s1Fields->SetAttribute(nsGkAtoms::target,
++                                       std::move(s1BogusIds));
++                nsTArray<CacheData> s1Data;
++                s1Data.AppendElement(CacheData(s1PoisonAcc->ID(), s1Fields));
++                ipcDoc->SendCache(CacheUpdateType::Update, s1Data);
++                printf_stderr(
++                    "S1PROBE forge sent poison=%llu bogus=%llu\n",
++                    static_cast<unsigned long long>(s1PoisonAcc->ID()),
++                    static_cast<unsigned long long>(0xDEADBEEFCAFEULL));
++              }
++            }
++          }
++          // S1 FORGE END.
+           ipcDoc->PushMutationEventData(
+               HideEventData{id, aEvent->IsFromUserInput()});
+           break;
++        }
+ 
+         case nsIAccessibleEvent::EVENT_INNER_REORDER:
+         case nsIAccessibleEvent::EVENT_REORDER:
+diff --git a/accessible/ipc/RemoteAccessible.cpp b/accessible/ipc/RemoteAccessible.cpp
+index 0d4ef86..61cb802 100644
+--- a/accessible/ipc/RemoteAccessible.cpp
++++ b/accessible/ipc/RemoteAccessible.cpp
+@@ -10,6 +10,8 @@
+ #include "Relation.h"
+ #include "TextLeafRange.h"
+ #include "mozilla/Monitor.h"
++#include "mozilla/Preferences.h"
++#include "mozilla/Printf.h"
+ #include "mozilla/a11y/CacheConstants.h"
+ #include "mozilla/a11y/DocAccessibleParent.h"
+ #include "mozilla/a11y/DocManager.h"
+@@ -310,6 +312,29 @@ bool RemoteAccessible::ApplyCache(CacheUpdateType aUpdateType,
+     mCachedFields->Update(aFields);
+   }
+ 
++  // S1PROBE BEGIN (test-only parent-side instrumentation; remove before
++  // filing upstream). Prints when a `target` (DETAILS) relation field lands
++  // on this remote acc. When the a11y4.p0.enabled pref is set (fallback
++  // trigger for runs where the harness cannot drive the xpc consumer query),
++  // query DETAILS on the poisoned object itself: the ARM1 fallback crashes
++  // here; ARM2 prints the fix marker and survives.
++  if (aFields->HasAttribute(nsGkAtoms::target)) {
++    auto s1TargetArr =
++        aFields->GetAttribute<nsTArray<uint64_t>>(nsGkAtoms::target);
++    printf_stderr("S1PROBE poison-arrived acc=%llu n=%u\n",
++                  static_cast<unsigned long long>(ID()),
++                  s1TargetArr ? static_cast<unsigned>(s1TargetArr->Length())
++                              : 0u);
++    if (Preferences::GetBool("a11y4.p0.enabled", false)) {
++      printf_stderr("S1PROBE p0-trigger acc=%llu\n",
++                    static_cast<unsigned long long>(ID()));
++      (void)this->RelationByType(RelationType::DETAILS);
++      printf_stderr("S1PROBE p0-returned acc=%llu\n",
++                    static_cast<unsigned long long>(ID()));
++    }
++  }
++  // S1PROBE END.
++
+   if (IsText()) {
+     RemoteAccessible* parent = RemoteParent();
+     if (parent && parent->IsHyperText()) {
+@@ -1390,6 +1415,20 @@ Relation RemoteAccessible::RelationByType(RelationType aType) const {
+       if (auto maybeIds = aAcc->mCachedFields->GetAttribute<nsTArray<uint64_t>>(
+               data.mAtom)) {
+         if (data.mAtom == nsGkAtoms::target) {
++          // S1PROBE BEGIN (test-only discriminator; remove before filing
++          // upstream). resolved=0 prints immediately before the ARM1 crash on
++          // the poisoned acc; resolved=1 on ordinary anchor-positioned
++          // details elements proves the probe is live.
++          if (!maybeIds->IsEmpty()) {
++            RemoteAccessible* s1TargetAcc =
++                aAcc->mDoc->GetAccessible(maybeIds->ElementAt(0));
++            printf_stderr(
++                "S1PROBE details acc=%llu firstTarget=%llu resolved=%d\n",
++                static_cast<unsigned long long>(aAcc->ID()),
++                static_cast<unsigned long long>(maybeIds->ElementAt(0)),
++                s1TargetAcc ? 1 : 0);
++          }
++          // S1PROBE END.
+           if (!maybeIds->IsEmpty() &&
+               !nsAccUtils::IsValidDetailsTargetForAnchor(
+                   aAcc->mDoc->GetAccessible(maybeIds->ElementAt(0)), aAcc)) {
