@@ -11,7 +11,7 @@ index 2ae68a9..4472ab7 100644
 +  // :1090). Placed before the old child doc is unbound so a rejected bind
 +  // mutates no state.
 +  if (!outerDoc->RemoteParent() && !outerDoc->IsDoc()) {
-+    NS_WARNING("S3PROBE fix rejected detached embedder");
++    printf_stderr("S3PROBE fix rejected detached embedder\n");
 +    return IPC_FAIL(this, "binding to detached embedder");
 +  }
 +  // S3 FIX-PROBE END.
