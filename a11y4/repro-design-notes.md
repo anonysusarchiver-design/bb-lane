@@ -53,9 +53,11 @@ existed, or was already removed).
     (browser-chrome, a11y subsuite) + manifest entry.
   - The page inline script hides `#s1-trigger` at +2 s (fires the forge even
     if the harness task stalls); the test additionally drives the hide via
-    `invokeContentTask` at +1 s, waits 2.5 s for the cache flush, then
-    performs the consumer query (`poison.getRelationByType(RELATION_DETAILS)`)
-    and asserts survival + empty relation.
+    `invokeContentTask` immediately (no timers inside the content task — its
+    SpecialPowers.spawn sandbox has no bare window globals), waits 2.5 s
+    (parent scope) for the cache flush, then performs the consumer query
+    (`poison.getRelationByType(RELATION_DETAILS)`) and asserts survival +
+    empty relation.
 - `s1-fix.patch` (candidate guard):
   - `nsAccUtils::IsValidDetailsTargetForAnchor`: `if (!aTarget) return
     false;` at entry (+ `S1PROBE fix rejected null target` marker).
@@ -100,3 +102,14 @@ patched-source snapshots, patch sha256s, binary sha256, `meta.json`,
 Detections: crash = `application terminated with exit code` in transcript,
 `PROCESS-CRASH`, or a core dump; frames = gdb backtrace matching
 `IsValidDetailsTargetForAnchor|RemoteAccessible::RelationByType|Accessible::IsAncestorOf`.
+
+## Revisions
+
+- v1.5 (lesson from run 38231858823, verdict INCONCLUSIVE): the
+  content-side hide task must not use bare window globals — `setTimeout`
+  inside `invokeContentTask`'s SpecialPowers.spawn sandbox throws
+  `ReferenceError: setTimeout is not defined` (the test aborts before the
+  forge; zero probes). The task now hides the trigger immediately via
+  `content.document` (matching the proven pattern in
+  `accessible/tests/browser/relations/head.js`); the 2 s page-script
+  fallback and the parent-scope 2.5 s wait are unchanged.

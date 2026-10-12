@@ -13,10 +13,10 @@ index 10aa3b5..32264b7 100644
  ["browser_multiple_relations_crash.js"]
 diff --git a/accessible/tests/browser/relations/browser_a11y4_s1.js b/accessible/tests/browser/relations/browser_a11y4_s1.js
 new file mode 100644
-index 0000000..2e64efd
+index 0000000..02f376a
 --- /dev/null
 +++ b/accessible/tests/browser/relations/browser_a11y4_s1.js
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,67 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -60,11 +60,12 @@ index 0000000..2e64efd
 +    poison.getRelationByType(Ci.nsIAccessibleRelation.RELATION_DETAILS);
 +
 +    // Drive the content-side forge (hide #s1-trigger). The inline script
-+    // above does the same at 2s if this task never reaches here.
++    // above does the same at 2s if this task never reaches here. Note: the
++    // task runs in a SpecialPowers.spawn sandbox without bare window globals,
++    // so it must not use setTimeout; the harness-level wait below (parent
++    // scope) gives the forged cache update time to land.
 +    await invokeContentTask(browser, [], () => {
-+      setTimeout(() => {
-+        content.document.getElementById("s1-trigger").hidden = true;
-+      }, 1000);
++      content.document.getElementById("s1-trigger").hidden = true;
 +    });
 +
 +    await new Promise(resolve => setTimeout(resolve, 2500));
