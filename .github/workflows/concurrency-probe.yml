@@ -1,0 +1,49 @@
+# bb-lane — concurrency-probe: empirically measure the concurrent-job ceiling
+# for GitHub-hosted standard runners on this account/repo. 20 matrix jobs, each
+# prints START/END markers (epoch + ISO) around a hold sleep; per-job
+# started_at / completed_at from the Actions API is the authoritative timeline.
+#
+# Dispatch (curl, body-file):
+#   POST /repos/anonysusarchiver-design/bb-lane/actions/workflows/concurrency-probe.yml/dispatches
+#   body: {"ref":"main","inputs":{"hold_seconds":"90"}}
+#
+# Public content only: no secrets, no external fetches.
+name: concurrency-probe
+run-name: concurrency-probe hold=${{ github.event.inputs.hold_seconds }}s
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_seconds:
+        description: "seconds each job holds between START and END markers (default 90)"
+        required: false
+        default: "90"
+
+concurrency:
+  group: concurrency-probe
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe-${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - name: START marker
+        run: |
+          echo "START shard=${{ matrix.shard }} epoch=$(date +%s) iso=$(date -u +%Y-%m-%dT%H:%M:%SZ) runner=$RUNNER_NAME"
+      - name: Hold
+        env:
+          HOLD: ${{ github.event.inputs.hold_seconds }}
+        run: sleep "${HOLD:-90}"
+      - name: END marker
+        run: |
+          echo "END shard=${{ matrix.shard }} epoch=$(date +%s) iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

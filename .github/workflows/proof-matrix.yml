@@ -1,0 +1,105 @@
+# bb-lane — proof-matrix: reusable fan-out skeleton for dynamic-verification
+# jobs. ONE dispatch = N parallel verification jobs (matrix driven by a JSON
+# array input). Each job: checkout source_rev -> optionally apply patch URLs ->
+# run the verification command -> tee everything into evidence -> upload the
+# evidence dir as an artifact (always, even on failure).
+#
+# Dispatch (curl, body-file):
+#   POST /repos/anonysusarchiver-design/bb-lane/actions/workflows/proof-matrix.yml/dispatches
+#   body: {"ref":"main","inputs":{
+#            "targets":"[\"job-a\",\"job-b\"]",
+#            "source_rev":"main",
+#            "command":"echo verify && uname -a"}}
+#
+# NOTE: all inputs are trusted-dispatcher controlled; `command` is evaluated in
+# the shell by design (this lane is a private verification harness; never pass
+# untrusted strings here). A non-zero verification exit marks the job red while
+# the evidence artifact still uploads.
+name: proof-matrix
+run-name: proof-matrix ${{ github.event.inputs.label }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "run label (a-z0-9-_)"
+        required: false
+        default: "proof"
+      targets:
+        description: "JSON array of target labels; one matrix job per label"
+        required: false
+        default: '["target-a","target-b"]'
+      source_rev:
+        description: "git revision to check out for verification"
+        required: false
+        default: "main"
+      patches:
+        description: "JSON array of patch URLs to apply before running (may be empty)"
+        required: false
+        default: "[]"
+      command:
+        description: "verification command to run per target"
+        required: false
+        default: "echo verify && uname -a"
+      evidence_dir:
+        description: "evidence directory (uploaded as artifact per target)"
+        required: false
+        default: "evidence"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(github.event.inputs.targets) }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.source_rev }}
+          fetch-depth: 1
+      - name: Apply patches
+        if: ${{ github.event.inputs.patches != '[]' }}
+        env:
+          PATCHES: ${{ github.event.inputs.patches }}
+        run: |
+          set -euo pipefail
+          mkdir -p _patches
+          echo "$PATCHES" | python3 -c 'import json,sys; [print(u) for u in json.load(sys.stdin)]' | while read -r u; do
+            f="_patches/$(basename "$u")"
+            curl -sSL --retry 3 --retry-delay 2 -o "$f" "$u"
+            git apply --verbose "$f"
+          done
+      - name: Run verification
+        env:
+          TARGET: ${{ matrix.target }}
+          SOURCE_REV: ${{ github.event.inputs.source_rev }}
+          CMD: ${{ github.event.inputs.command }}
+        run: |
+          mkdir -p "${{ github.event.inputs.evidence_dir }}"
+          LOG="${{ github.event.inputs.evidence_dir }}/${TARGET}.log"
+          {
+            echo "target=${TARGET} source_rev=${SOURCE_REV}"
+            echo "start=$(date -u +%Y-%m-%dT%H:%M:%SZ) epoch=$(date +%s)"
+            set +e
+            eval "$CMD"
+            rc=$?
+            set -e
+            echo "rc=${rc}"
+            echo "end=$(date -u +%Y-%m-%dT%H:%M:%SZ) epoch=$(date +%s)"
+          } 2>&1 | tee "$LOG"
+          exit "${rc:-1}"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ matrix.target }}-${{ github.run_id }}
+          path: ${{ github.event.inputs.evidence_dir }}
+          if-no-files-found: warn
+          retention-days: 14
