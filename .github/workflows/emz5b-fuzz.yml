@@ -23,7 +23,7 @@ on:
         required: false
         default: "warmup"
       kit_b64:
-        description: "kit JSON {files:[{path,data(b64)}]}, base64 (or z:+zlib)"
+        description: "kit JSON {files:[{path,data}]}; data and/or whole kit may be z:+zlib-base64 (plain b64 still accepted)"
         required: true
       source_url:
         description: "explicit ASAN jsshell zip URL (empty = resolve taskcluster index at runtime)"
@@ -98,7 +98,8 @@ jobs:
               p = f["path"]
               assert p.startswith("kit/") and ".." not in p, "bad kit path: " + p
               os.makedirs(os.path.dirname(p), exist_ok=True)
-              raw = base64.b64decode(f["data"])
+              d = f["data"]
+              raw = zlib.decompress(base64.b64decode(d[2:])) if d.startswith("z:") else base64.b64decode(d)
               open(p, "wb").write(raw)
               n += 1; total += len(raw)
           print("kit files:", n, "bytes:", total)
