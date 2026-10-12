@@ -22,7 +22,9 @@
 # harness sets MOZ_CRASHREPORTER_SHUTDOWN, so a guard-rejected run may exit
 # early (rc!=0, final test assertion may not run) - ARM2 therefore judges
 # rejection + no-parent-crash, NOT clean exit; (c) 0 executed tests is
-# PACKAGING-BLOCKED, never evidence.
+# PACKAGING-BLOCKED, never evidence; (d) the runner wraps step scripts in
+# `bash -e` (v1.4) -> every per-run command must guard with `|| rc=$?` or a
+# non-zero rc aborts the loop after run 1 (runs 38183150897 / 38191364350).
 #
 # Verdict classes (report-only step): ZOMBIE-CONFIRMED (+ GUARD-HELD) /
 # INCONCLUSIVE / PACKAGING-BLOCKED.
@@ -204,6 +206,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 40
         run: |
+          set +e
           set -uo pipefail
           trap '' HUP
           exec > >(tee a11y3-arm1.log) 2>&1
@@ -227,6 +230,7 @@ jobs:
 
           crashes=0
           frames=0
+          hangs=0
           zombie_runs=0
           forge_runs=0
           bind_sent_runs=0
@@ -237,16 +241,23 @@ jobs:
             rm -f /tmp/cores/core.* 2>/dev/null || true
             LOG="$OUT/run-$i.log"
             cd "$WORK/mc"
-            # v1.3: setsid isolates the xvfb/mochitest process group (stray signals from
-            # xvfb-run teardown killed this script mid-run-1 in run 38183150897); timeout
-            # bounds the post-finish shutdown hang (default app-timeout 370s/run).
+            # v1.4: the runner wraps this script in `bash -e`; without the `|| rc=$?`
+            # guard a non-zero per-run rc (timeout-kill 124 on the shutdown hang)
+            # aborted the loop after run 1 (runs 38183150897 / 38191364350). setsid
+            # isolates the process group; timeout bounds the hang (default 370s/run).
+            rc=0
             setsid timeout -k 10 180 xvfb-run -a -s "-screen 0 1280x1024x24" ./mach mochitest \
               --setpref accessibility.force_disabled=-1 \
               --setpref security.sandbox.content.level=0 \
-              "$TEST" > "$LOG" 2>&1
-            rc=$?
+              "$TEST" > "$LOG" 2>&1 || rc=$?
             cd "$WORK"
+            pkill -f "obj-a11y3/dist/bin/firefox" 2>/dev/null || true
+            pkill Xvfb 2>/dev/null || true
+            sleep 1
             echo "run $i: mochitest rc=$rc"
+            hangthis="no"
+            if [ "$rc" = "124" ] || ! grep -a -q "SUITE_END" "$LOG"; then hangthis="yes"; fi
+            [ "$hangthis" = "yes" ] && hangs=$((hangs+1))
 
             grep -a 'S3PROBE' "$LOG" > "$OUT/run-$i-probes.txt" 2>/dev/null || true
             zthis="no"
@@ -284,7 +295,7 @@ jobs:
               echo "run $i: test reached the survived-assertion"
             fi
 
-            echo "run $i: cores=$ncores crash=$crash frame=$frame filtered=$filtered zombie=$zthis forge=$fthis bind_sent=$bthis"
+            echo "run $i: cores=$ncores crash=$crash frame=$frame filtered=$filtered zombie=$zthis forge=$fthis bind_sent=$bthis hang=$hangthis"
             [ "$crash" = "yes" ] && crashes=$((crashes+1))
             [ "$frame" = "yes" ] && frames=$((frames+1))
             echo "run $i probes:"
@@ -293,10 +304,11 @@ jobs:
             tail -n 15 "$LOG" | sed 's/^/  tail| /'
           done
 
-          echo "ARM1 RESULT: crashes=$crashes/$runs frames=$frames/$runs zombie_runs=$zombie_runs/$runs forge_runs=$forge_runs/$runs bind_sent_runs=$bind_sent_runs/$runs test_discovered=$discovered"
+          echo "ARM1 RESULT: crashes=$crashes/$runs frames=$frames/$runs zombie_runs=$zombie_runs/$runs forge_runs=$forge_runs/$runs bind_sent_runs=$bind_sent_runs/$runs hang_runs=$hangs/$runs test_discovered=$discovered"
           {
             echo "crashes=$crashes/$runs"
             echo "frames=$frames/$runs"
+            echo "hangs=$hangs/$runs"
             echo "zombie_runs=$zombie_runs/$runs"
             echo "forge_runs=$forge_runs/$runs"
             echo "bind_sent_runs=$bind_sent_runs/$runs"
@@ -312,6 +324,7 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         timeout-minutes: 70
         run: |
+          set +e
           set -uo pipefail
           exec > >(tee a11y3-arm2.log) 2>&1
           WORK="$(pwd)"
@@ -353,13 +366,18 @@ jobs:
           echo "================ ARM2 RUN (guarded build) ================"
           LOG="$OUT/run-1.log"
           cd "$WORK/mc"
-          xvfb-run -a -s "-screen 0 1280x1024x24" ./mach mochitest \
+          rc=0
+          setsid timeout -k 10 180 xvfb-run -a -s "-screen 0 1280x1024x24" ./mach mochitest \
             --setpref accessibility.force_disabled=-1 \
             --setpref security.sandbox.content.level=0 \
-            "$TEST" > "$LOG" 2>&1
-          rc=$?
+            "$TEST" > "$LOG" 2>&1 || rc=$?
           cd "$WORK"
+          pkill -f "obj-a11y3/dist/bin/firefox" 2>/dev/null || true
+          pkill Xvfb 2>/dev/null || true
           echo "arm2 run rc=$rc"
+          hang="no"
+          if [ "$rc" = "124" ] || ! grep -a -q "SUITE_END" "$LOG"; then hang="yes"; fi
+          echo "arm2 run hang=$hang"
 
           fix_marker="no"
           ipc_fail_sig="no"
@@ -403,6 +421,7 @@ jobs:
             echo "parent_crash=$parent_crash"
             echo "test_discovered=$discovered"
             echo "mochitest_rc=$rc"
+            echo "hang=$hang"
           } > "$OUT/result.txt"
           cat "$OUT/result.txt"
           sudo dmesg 2>/dev/null | tail -n 50 > "$OUT/dmesg.txt" || true
@@ -426,6 +445,7 @@ jobs:
             cat out/arm1/result.txt
             Z=$(sed -n 's|^zombie_runs=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
             C=$(sed -n 's|^crashes=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
+            H=$(sed -n 's|^hangs=\([0-9]*\)/.*|\1|p' out/arm1/result.txt | head -1)
             D=$(sed -n 's|^test_discovered=\(.*\)$|\1|p' out/arm1/result.txt | head -1)
             if [ "$D" = "no" ]; then
               V="VERDICT: PACKAGING-BLOCKED - mochitest did not execute the testcase (0 runs is NOT evidence)"
@@ -434,7 +454,7 @@ jobs:
             elif [ "${C:-0}" != "0" ]; then
               V="VERDICT: INCONCLUSIVE - unexpected ARM1 crashes ($C/5; zombie_runs=$Z/5); inspect cores"
             elif [ ! -s out/arm2/result.txt ]; then
-              V="VERDICT: ZOMBIE-CONFIRMED ($Z/5 runs) + GUARD NO-RESULT - see a11y3 arm2 step log"
+              V="VERDICT: ZOMBIE-CONFIRMED ($Z/5 runs, hang_runs=${H:-?}/5) + GUARD NO-RESULT - see a11y3 arm2 step log"
             else
               cat out/arm2/result.txt
               FM=$(sed -n 's|^fix_marker=\(.*\)$|\1|p' out/arm2/result.txt | head -1)
@@ -443,7 +463,7 @@ jobs:
               if [ "$PC" = "yes" ]; then
                 V="VERDICT: ZOMBIE-CONFIRMED ($Z/5) + GUARD FALSIFIED (parent crashed with guard applied)"
               elif [ "$FM" = "yes" ] && [ "${Z2:-1}" = "0" ]; then
-                V="VERDICT: ZOMBIE-CONFIRMED ($Z/5, 0 crashes) + GUARD-HELD (guard rejected the forged bind; no zombie line; parent survived)"
+                V="VERDICT: ZOMBIE-CONFIRMED ($Z/5, 0 crashes, hang_runs=${H:-?}/5) + GUARD-HELD (guard rejected the forged bind; no zombie line; parent survived)"
               else
                 V="VERDICT: ZOMBIE-CONFIRMED ($Z/5) + GUARD INCONCLUSIVE (fix marker not observed; zombie_lines=$Z2) - inspect arm2 logs"
               fi
