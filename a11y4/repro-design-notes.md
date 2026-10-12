@@ -105,6 +105,16 @@ Detections: crash = `application terminated with exit code` in transcript,
 
 ## Revisions
 
+- v1.6 (lessons from run 38245152915): (a) the ARM1 crash counter never
+  accumulated — `[ "$crash" = "yes" ] && crashes=$((crashes+1))` was missing
+  from the run loop. Per-run logs showed `crash=yes` with 5/5 cores + gdb
+  backtraces and the expected frames, yet `result.txt` reported `crashes=0/5`
+  and the verdict line degraded to INCONCLUSIVE; fixed. (b) The
+  `poison-arrived` ApplyCache probe checked the incoming `aFields` AFTER
+  `mCachedFields->Update(aFields)`, which MOVES entries and empties `aFields`
+  (the probe never fired even though the forged field had landed — probe A
+  read it back); it now checks the merged `mCachedFields`.
+
 - v1.5 (lesson from run 38231858823, verdict INCONCLUSIVE): the
   content-side hide task must not use bare window globals — `setTimeout`
   inside `invokeContentTask`'s SpecialPowers.spawn sandbox throws

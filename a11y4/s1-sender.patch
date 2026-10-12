@@ -60,7 +60,7 @@ index 3997019..2e7f475 100644
          case nsIAccessibleEvent::EVENT_INNER_REORDER:
          case nsIAccessibleEvent::EVENT_REORDER:
 diff --git a/accessible/ipc/RemoteAccessible.cpp b/accessible/ipc/RemoteAccessible.cpp
-index 0d4ef86..61cb802 100644
+index 0d4ef86..c4abca8 100644
 --- a/accessible/ipc/RemoteAccessible.cpp
 +++ b/accessible/ipc/RemoteAccessible.cpp
 @@ -10,6 +10,8 @@
@@ -72,19 +72,21 @@ index 0d4ef86..61cb802 100644
  #include "mozilla/a11y/CacheConstants.h"
  #include "mozilla/a11y/DocAccessibleParent.h"
  #include "mozilla/a11y/DocManager.h"
-@@ -310,6 +312,29 @@ bool RemoteAccessible::ApplyCache(CacheUpdateType aUpdateType,
+@@ -310,6 +312,31 @@ bool RemoteAccessible::ApplyCache(CacheUpdateType aUpdateType,
      mCachedFields->Update(aFields);
    }
  
 +  // S1PROBE BEGIN (test-only parent-side instrumentation; remove before
-+  // filing upstream). Prints when a `target` (DETAILS) relation field lands
-+  // on this remote acc. When the a11y4.p0.enabled pref is set (fallback
-+  // trigger for runs where the harness cannot drive the xpc consumer query),
-+  // query DETAILS on the poisoned object itself: the ARM1 fallback crashes
-+  // here; ARM2 prints the fix marker and survives.
-+  if (aFields->HasAttribute(nsGkAtoms::target)) {
++  // filing upstream). Prints when a `target` (DETAILS) relation field has
++  // landed on this remote acc. Checked on the merged cache: the
++  // mCachedFields->Update above MOVES entries out of the incoming aFields
++  // (emptying it), so aFields is unusable here. When the a11y4.p0.enabled
++  // pref is set (fallback trigger for runs where the harness cannot drive the
++  // xpc consumer query), query DETAILS on the poisoned object itself: the
++  // ARM1 fallback crashes here; ARM2 prints the fix marker and survives.
++  if (mCachedFields && mCachedFields->HasAttribute(nsGkAtoms::target)) {
 +    auto s1TargetArr =
-+        aFields->GetAttribute<nsTArray<uint64_t>>(nsGkAtoms::target);
++        mCachedFields->GetAttribute<nsTArray<uint64_t>>(nsGkAtoms::target);
 +    printf_stderr("S1PROBE poison-arrived acc=%llu n=%u\n",
 +                  static_cast<unsigned long long>(ID()),
 +                  s1TargetArr ? static_cast<unsigned>(s1TargetArr->Length())
@@ -102,7 +104,7 @@ index 0d4ef86..61cb802 100644
    if (IsText()) {
      RemoteAccessible* parent = RemoteParent();
      if (parent && parent->IsHyperText()) {
-@@ -1390,6 +1415,20 @@ Relation RemoteAccessible::RelationByType(RelationType aType) const {
+@@ -1390,6 +1417,20 @@ Relation RemoteAccessible::RelationByType(RelationType aType) const {
        if (auto maybeIds = aAcc->mCachedFields->GetAttribute<nsTArray<uint64_t>>(
                data.mAtom)) {
          if (data.mAtom == nsGkAtoms::target) {

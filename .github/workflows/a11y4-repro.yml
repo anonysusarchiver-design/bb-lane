@@ -328,6 +328,7 @@ jobs:
               if grep -q -E "RecvCache|ApplyCache" "$BTF"; then bt_p0="yes"; fi
             done
             if [ "$ncores" -gt 0 ]; then crash="yes"; fi
+            [ "$crash" = "yes" ] && crashes=$((crashes+1))
             [ "$frame" = "yes" ] && frames=$((frames+1))
             [ "$bt_xpc" = "yes" ] && xpc_bt_runs=$((xpc_bt_runs+1))
             [ "$bt_p0" = "yes" ] && p0_bt_runs=$((p0_bt_runs+1))
