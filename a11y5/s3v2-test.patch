@@ -1,0 +1,94 @@
+diff --git a/testing/mochitest/tests/Harness_sanity/mochitest.toml b/testing/mochitest/tests/Harness_sanity/mochitest.toml
+index 1d3ff06..f74b672 100644
+--- a/testing/mochitest/tests/Harness_sanity/mochitest.toml
++++ b/testing/mochitest/tests/Harness_sanity/mochitest.toml
+@@ -82,3 +82,5 @@ fail-if = [
+ ]
+ 
+ ["test_sanity_waitForCondition.html"]
++
++["test_a11y5_forge.html"]
+diff --git a/testing/mochitest/tests/Harness_sanity/test_a11y5_forge.html b/testing/mochitest/tests/Harness_sanity/test_a11y5_forge.html
+new file mode 100644
+index 0000000..1204f2f
+--- /dev/null
++++ b/testing/mochitest/tests/Harness_sanity/test_a11y5_forge.html
+@@ -0,0 +1,78 @@
++<!DOCTYPE HTML>
++<html>
++<head>
++  <meta charset="utf-8">
++  <title>S3-V2 wrong-embedder bind repro (forged BindChildDoc under an attached non-embedder OuterDoc)</title>
++  <script src="/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css">
++</head>
++<body>
++<script>
++SimpleTest.waitForExplicitFinish();
++SimpleTest.requestFlakyTimeout("deliberate waits for the a11y pipeline to flush");
++
++// S3-V2 Arm 1 repro (plain mochitest: the forge is emitted by the test-only
++// sender patch in the CONTENT process, which requires a remote/ipcDoc
++// accessible — a plain content test provides exactly that; a chrome test
++// would run in the parent and ipcDoc would be null).
++//
++// This page hosts three same-process iframes:
++//  - #a11y5-forge:  hiding this element (display:none) fires a single
++//                   EVENT_HIDE for its OuterDoc in the content process, where
++//                   the forge crafts, for this element only:
++//                     batch [Hide(O1), Hide(O2)], BindChildDoc(D2, O3)
++//                   with O1 = #a11y5-forge's OuterDoc, O2 = #a11y5-victim's
++//                   OuterDoc, D2 = #a11y5-victim's inner document and
++//                   O3 = #a11y5-target's OuterDoc.
++//  - #a11y5-victim: left untouched and visible; only its embedder's hide is
++//                   forged, which un-parents D2 (the normal outer-doc
++//                   shutdown path) so that the forged BindChildDoc(D2, O3)
++//                   loads: O3 is attached and a valid-shape OuterDoc, but it
++//                   is NOT D2's embedder (no detach is needed — S3's
++//                   detached-target guard would not fire).
++//  - #a11y5-target: left untouched and visible; its OuterDoc O3 is the wrong
++//                   bind target; O3's previous child doc is silently unbound
++//                   by the replace-old block when the forged bind is accepted.
++//
++// Expected: no crash; the parent's S3V2PROBE bind line for D2 shows
++// embedder=O3, prev-mismatch=1, s3-guard-inert=1, target-prev-differs=1 —
++// a silently misplaced live document (wrong-embedder bind), contradicting
++// the content-side embedding. With s3v2-fix.patch applied (guard probe), the
++// forged bind is rejected via IPC_FAIL ("binding to wrong embedder"), the
++// fix marker is printed, no prev-mismatch=1 bind line appears and the parent
++// still survives.
++
++is(SpecialPowers.getIntPref("accessibility.force_disabled"), -1,
++   "a11y is force-enabled for this test");
++
++// All frames are srcdoc documents: about:srcdoc frames inherit this page's
++// principal and are allocated to this page's content process
++// (ProcessIsolation::IsolationBehaviorForURI -> WebContent on the inherited
++// principal), which is what the forged same-process BindChildDoc requires.
++const victim = document.createElement("iframe");
++victim.id = "a11y5-victim";
++victim.srcdoc = "<title>v</title><p>a11y5 victim iframe</p>";
++document.body.appendChild(victim);
++
++const target = document.createElement("iframe");
++target.id = "a11y5-target";
++target.srcdoc = "<title>t</title><p>a11y5 wrong-embedder target iframe</p>";
++document.body.appendChild(target);
++
++const forge = document.createElement("iframe");
++forge.id = "a11y5-forge";
++forge.srcdoc = "<title>f</title><p>a11y5 forge iframe</p>";
++document.body.appendChild(forge);
++
++setTimeout(() => {
++  // Fire the forge: hides #a11y5-forge's OuterDoc, which drives the crafted
++  // sender path. The victim and target iframes are never touched by the page.
++  forge.style.display = "none";
++  setTimeout(() => {
++    ok(true, "parent process survived the forged wrong-embedder bind");
++    SimpleTest.finish();
++  }, 4000);
++}, 3000);
++</script>
++</body>
++</html>

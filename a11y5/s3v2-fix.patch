@@ -1,0 +1,60 @@
+diff --git a/accessible/ipc/DocAccessibleParent.cpp b/accessible/ipc/DocAccessibleParent.cpp
+index 1bd34ce..a9a91f9 100644
+--- a/accessible/ipc/DocAccessibleParent.cpp
++++ b/accessible/ipc/DocAccessibleParent.cpp
+@@ -1083,6 +1083,29 @@ ipc::IPCResult DocAccessibleParent::AddChildDoc(DocAccessibleParent* aChildDoc,
+     return IPC_FAIL(this, "Binding to parent that isn't a valid OuterDoc!");
+   }
+ 
++  // S3V2 FIX-PROBE BEGIN (guard under test; remove before filing upstream).
++  // Mirrors the missing target-identity check: a child doc that was unbound
++  // from its embedder must only be re-bound under that same OuterDoc, so a
++  // forged re-bind under a different OuterDoc is rejected before any state
++  // mutation at the replace-old/bind block. This closes Arm 1 (wrong-O; the
++  // S3-style detached-target check alone cannot catch it because the forged
++  // target is attached) and Arm 2 (stale-child re-bind). mLastEmbedderID is
++  // recorded in Unbind() while the doc still knows its embedder. The
++  // S3-style detached-target check is kept below as a secondary defence
++  // with its own marker.
++  if (aChildDoc->mLastEmbedderID && aChildDoc->mLastEmbedderID != aParentID) {
++    printf_stderr(
++        "S3V2PROBE fix rejected wrong-embedder bind child=%" PRIu64
++        " last-embedder=%" PRIu64 " target=%" PRIu64 "\n",
++        aChildDoc->mActorID, aChildDoc->mLastEmbedderID, aParentID);
++    return IPC_FAIL(this, "binding to wrong embedder");
++  }
++  if (!outerDoc->RemoteParent() && !outerDoc->IsDoc()) {
++    printf_stderr("S3V2PROBE fix rejected detached embedder\n");
++    return IPC_FAIL(this, "binding to detached embedder");
++  }
++  // S3V2 FIX-PROBE END.
++
+   if (outerDoc->ChildCount() == 1) {
+     MOZ_ASSERT(outerDoc->RemoteChildAt(0)->AsDoc());
+     outerDoc->RemoteChildAt(0)->AsDoc()->Unbind();
+diff --git a/accessible/ipc/DocAccessibleParent.h b/accessible/ipc/DocAccessibleParent.h
+index 2871340..d201485 100644
+--- a/accessible/ipc/DocAccessibleParent.h
++++ b/accessible/ipc/DocAccessibleParent.h
+@@ -182,6 +182,9 @@ class DocAccessibleParent : public RemoteAccessible,
+       parent->ClearChildDoc(this);
+       DebugOnly<bool> result = parentDoc->mChildDocs.RemoveElement(mActorID);
+       MOZ_ASSERT(result);
++      // S3V2 FIX-PROBE: remember the embedder this child doc was unbound from
++      // (test-only guard state; remove before filing upstream).
++      mLastEmbedderID = parent->ID();
+     }
+ 
+     SetParent(nullptr);
+@@ -442,6 +445,11 @@ class DocAccessibleParent : public RemoteAccessible,
+   uint32_t mPendingShowIndex = 0;
+   nsTHashSet<uint64_t> mMovingIDs;
+   uint64_t mActorID;
++  // S3V2 FIX-PROBE (test-only guard state; remove before filing upstream):
++  // the embedder OuterDoc ID this child doc was last unbound from; non-zero
++  // means this doc has been bound before and may only be re-bound under that
++  // same OuterDoc.
++  uint64_t mLastEmbedderID = 0;
+   bool mTopLevel : 1;
+   bool mTopLevelInContentProcess : 1;
+   bool mShutdown : 1;

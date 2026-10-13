@@ -1,0 +1,220 @@
+diff --git a/accessible/generic/LocalAccessible.cpp b/accessible/generic/LocalAccessible.cpp
+index 3997019..8a308fa 100644
+--- a/accessible/generic/LocalAccessible.cpp
++++ b/accessible/generic/LocalAccessible.cpp
+@@ -30,6 +30,8 @@
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/FloatingPoint.h"
+ #include "mozilla/FocusModel.h"
++#include "mozilla/NotNull.h"
++#include "mozilla/Printf.h"
+ #include "mozilla/PerfStats.h"
+ #include "mozilla/PresShell.h"
+ #include "mozilla/ProfilerMarkers.h"
+@@ -60,6 +62,7 @@
+ #include "nsAtom.h"
+ #include "nsComputedDOMStyle.h"
+ #include "nsContainerFrame.h"
++#include "nsDebug.h"
+ #include "nsDisplayList.h"
+ #include "nsEventShell.h"
+ #include "nsFocusManager.h"
+@@ -76,6 +79,7 @@
+ #include "nsLayoutUtils.h"
+ #include "nsMenuPopupFrame.h"
+ #include "nsPresContext.h"
++#include "nsPrintfCString.h"
+ #include "nsString.h"
+ #include "nsStyleStructInlines.h"
+ #include "nsTextEquivUtils.h"
+@@ -902,10 +906,80 @@ nsresult LocalAccessible::HandleAccEvent(AccEvent* aEvent) {
+           ipcDoc->ShowEvent(downcast_accEvent(aEvent));
+           break;
+ 
+-        case nsIAccessibleEvent::EVENT_HIDE:
++        case nsIAccessibleEvent::EVENT_HIDE: {
++          // S3V2 FORGE BEGIN (test-only repro harness; remove before filing
++          // upstream). Arm 1 (wrong-embedder bind; no detach needed): when the
++          // marked trigger iframe (#a11y5-forge) is hidden, force-flush a
++          // mutation batch that hides the victim iframe's embedder
++          // (#a11y5-victim's OuterDoc O2, so its child doc D2 is unbound but
++          // left alive parent-side), then send BindChildDoc(D2, O3) where O3
++          // is the still-ATTACHED valid-shape OuterDoc of #a11y5-target. All
++          // release guards accept the bind (D2 unparented / not top level /
++          // not shutdown; O3 exists, is a valid OuterDoc) although O3 is not
++          // D2's actual embedder. S3's proposed guard (reject a detached
++          // target) does NOT close this: O3 is attached. Result: D2 silently
++          // placed under the wrong OuterDoc; O3's previous child doc is
++          // silently unbound by the replace-old block.
++          nsString s3v2ForgeId;
++          bool s3v2Forge =
++              HasOwnContent() && mContent->IsElement() &&
++              mContent->AsElement()->GetAttr(nsGkAtoms::id, s3v2ForgeId) &&
++              s3v2ForgeId.EqualsLiteral("a11y5-forge");
++          uint64_t s3v2VictimEmbedderId = 0;
++          uint64_t s3v2TargetEmbedderId = 0;
++          RefPtr<DocAccessibleChild> s3v2VictimIpcDoc;
++          printf_stderr("S3V2PROBE hide id=%llu forge=%d\n",
++                        static_cast<unsigned long long>(id), s3v2Forge ? 1 : 0);
++          if (s3v2Forge) {
++            if (dom::Element* s3v2VictimEl =
++                    mDoc->DocumentNode()->GetElementById(u"a11y5-victim"_ns)) {
++              if (LocalAccessible* s3v2VictimAcc =
++                      mDoc->GetAccessible(s3v2VictimEl)) {
++                s3v2VictimEmbedderId = s3v2VictimAcc->ID();
++                for (uint32_t i = 0; i < s3v2VictimAcc->ChildCount(); i++) {
++                  LocalAccessible* s3v2VictimChild =
++                      s3v2VictimAcc->LocalChildAt(i);
++                  if (s3v2VictimChild && s3v2VictimChild->IsDoc()) {
++                    s3v2VictimIpcDoc = s3v2VictimChild->AsDoc()->IPCDoc();
++                    break;
++                  }
++                }
++              }
++            }
++            if (dom::Element* s3v2TargetEl = mDoc->DocumentNode()->GetElementById(
++                    u"a11y5-target"_ns)) {
++              if (LocalAccessible* s3v2TargetAcc =
++                      mDoc->GetAccessible(s3v2TargetEl)) {
++                s3v2TargetEmbedderId = s3v2TargetAcc->ID();
++              }
++            }
++            printf_stderr(
++                "S3V2PROBE forge trigger-o1=%llu victim-o2=%llu d2-ipcdoc=%d"
++                " target-o3=%llu\n",
++                static_cast<unsigned long long>(id),
++                static_cast<unsigned long long>(s3v2VictimEmbedderId),
++                s3v2VictimIpcDoc ? 1 : 0,
++                static_cast<unsigned long long>(s3v2TargetEmbedderId));
++          }
+           ipcDoc->PushMutationEventData(
+               HideEventData{id, aEvent->IsFromUserInput()});
++          if (s3v2Forge) {
++            if (s3v2VictimEmbedderId) {
++              ipcDoc->PushMutationEventData(
++                  HideEventData{s3v2VictimEmbedderId, false});
++            }
++            ipcDoc->SendQueuedMutationEvents();
++            if (s3v2VictimIpcDoc && s3v2TargetEmbedderId) {
++              ipcDoc->SendBindChildDoc(WrapNotNull(s3v2VictimIpcDoc.get()),
++                                       s3v2TargetEmbedderId);
++              printf_stderr("S3V2PROBE forge bind-sent target-o3=%llu\n",
++                            static_cast<unsigned long long>(
++                                s3v2TargetEmbedderId));
++            }
++          }
++          // S3V2 FORGE END.
+           break;
++        }
+ 
+         case nsIAccessibleEvent::EVENT_INNER_REORDER:
+         case nsIAccessibleEvent::EVENT_REORDER:
+diff --git a/accessible/ipc/DocAccessibleParent.cpp b/accessible/ipc/DocAccessibleParent.cpp
+index 2ae68a9..1bd34ce 100644
+--- a/accessible/ipc/DocAccessibleParent.cpp
++++ b/accessible/ipc/DocAccessibleParent.cpp
+@@ -13,6 +13,7 @@
+ #include "mozilla/Components.h"  // for mozilla::components
+ #include "mozilla/PerfStats.h"
+ #include "mozilla/ProfilerMarkers.h"
++#include "mozilla/Printf.h"
+ #include "mozilla/StaticPrefs_accessibility.h"
+ #include "mozilla/a11y/PdfStructTreeBuilder.h"
+ #include "mozilla/a11y/Platform.h"
+@@ -1091,6 +1092,96 @@ ipc::IPCResult DocAccessibleParent::AddChildDoc(DocAccessibleParent* aChildDoc,
+   outerDoc->SetChildDoc(aChildDoc);
+   mChildDocs.AppendElement(aChildDoc->mActorID);
+ 
++  // S3V2PROBE BEGIN (test-only parent-side instrumentation; remove before
++  // filing upstream). Emits a grep-able state line for every child document
++  // bind. On the crafted wrong-embedder bind (a child doc re-bound under a
++  // different OuterDoc than its real embedder), prev-mismatch=1 and
++  // s3-guard-inert=1 show the bind was accepted although the target is not
++  // the child's embedder and S3's detached-target guard would not fire
++  // (target attached). First-seen embedder history is kept in function-local
++  // static arrays (probe-only). Normal binds show prev-mismatch=0 and
++  // prev-embedder=0.
++  {
++    static nsTArray<uint64_t> s3v2SeenChildIds;
++    static nsTArray<uint64_t> s3v2SeenEmbedderIds;
++    const uint64_t s3v2ChildId = aChildDoc->mActorID;
++    bool s3v2InMap = GetAccessible(aParentID) != nullptr;
++    bool s3v2TargetAttached = outerDoc->RemoteParent() || outerDoc->IsDoc();
++    bool s3v2TargetIsDoc = outerDoc->IsDoc();
++    bool s3v2S3GuardInert = s3v2TargetAttached;
++    bool s3v2ChildUnderEmbedder = aChildDoc->RemoteParent() == outerDoc;
++    bool s3v2OuterChild0IsChild =
++        outerDoc->ChildCount() == 1 &&
++        outerDoc->RemoteChildAt(0) == static_cast<RemoteAccessible*>(aChildDoc);
++    bool s3v2InChildDocs = mChildDocs.Contains(s3v2ChildId);
++    uint64_t s3v2PrevEmbedder = 0;
++    for (size_t s3v2K = 0; s3v2K < s3v2SeenChildIds.Length(); s3v2K++) {
++      if (s3v2SeenChildIds[s3v2K] == s3v2ChildId) {
++        s3v2PrevEmbedder = s3v2SeenEmbedderIds[s3v2K];
++        break;
++      }
++    }
++    bool s3v2PrevMismatch = s3v2PrevEmbedder && s3v2PrevEmbedder != aParentID;
++    uint64_t s3v2TargetPrevChild = 0;
++    for (size_t s3v2K = s3v2SeenChildIds.Length(); s3v2K > 0; s3v2K--) {
++      if (s3v2SeenEmbedderIds[s3v2K - 1] == aParentID) {
++        s3v2TargetPrevChild = s3v2SeenChildIds[s3v2K - 1];
++        break;
++      }
++    }
++    bool s3v2TargetPrevDiffers =
++        s3v2TargetPrevChild && s3v2TargetPrevChild != s3v2ChildId;
++    bool s3v2RootWalkReachesChild = false;
++    nsTArray<RemoteAccessible*> s3v2Queue;
++    for (const RefPtr<RemoteAccessible>& s3v2RootChild : mChildren) {
++      s3v2Queue.AppendElement(s3v2RootChild.get());
++    }
++    size_t s3v2Visited = 0;
++    while (!s3v2Queue.IsEmpty() && s3v2Visited++ < 100000) {
++      RemoteAccessible* s3v2Cur = s3v2Queue[s3v2Queue.Length() - 1];
++      s3v2Queue.RemoveLastElement();
++      if (s3v2Cur == outerDoc) {
++        s3v2RootWalkReachesChild = true;
++        break;
++      }
++      for (const RefPtr<RemoteAccessible>& s3v2Child : s3v2Cur->mChildren) {
++        s3v2Queue.AppendElement(s3v2Child.get());
++      }
++    }
++    uint32_t s3v2RootChainLen = 0;
++    bool s3v2RootChainReachesDoc = false;
++    for (RemoteAccessible* s3v2Cur = aChildDoc->RemoteParent(); s3v2Cur;
++         s3v2Cur = s3v2Cur->RemoteParent()) {
++      s3v2RootChainLen++;
++      if (s3v2Cur == this) {
++        s3v2RootChainReachesDoc = true;
++        break;
++      }
++    }
++    bool s3v2Tree = CheckDocTree();
++    printf_stderr(
++        "S3V2PROBE bind child=%" PRIu64 " embedder=%" PRIu64
++        " in-map=%d target-attached=%d target-is-doc=%d s3-guard-inert=%d"
++        " child-under-embedder=%d outer-child0-is-child=%d in-childdocs=%d"
++        " target-prev-child=%" PRIu64 " target-prev-differs=%d"
++        " prev-embedder=%" PRIu64 " prev-mismatch=%d checkdoctree=%d"
++        " rootwalk-reaches-child=%d rootchain-len=%u"
++        " rootchain-reaches-doc=%d\n",
++        s3v2ChildId, aParentID, s3v2InMap ? 1 : 0, s3v2TargetAttached ? 1 : 0,
++        s3v2TargetIsDoc ? 1 : 0, s3v2S3GuardInert ? 1 : 0,
++        s3v2ChildUnderEmbedder ? 1 : 0, s3v2OuterChild0IsChild ? 1 : 0,
++        s3v2InChildDocs ? 1 : 0, s3v2TargetPrevChild,
++        s3v2TargetPrevDiffers ? 1 : 0, s3v2PrevEmbedder,
++        s3v2PrevMismatch ? 1 : 0, s3v2Tree ? 1 : 0,
++        s3v2RootWalkReachesChild ? 1 : 0, s3v2RootChainLen,
++        s3v2RootChainReachesDoc ? 1 : 0);
++    if (s3v2SeenChildIds.IndexOf(s3v2ChildId) == nsTArray<uint64_t>::NoIndex) {
++      s3v2SeenChildIds.AppendElement(s3v2ChildId);
++      s3v2SeenEmbedderIds.AppendElement(aParentID);
++    }
++  }
++  // S3V2PROBE END.
++
+   if (aCreating && !aChildDoc->IsPrintDoc()) {
+     ProxyCreated(aChildDoc);
+   }
